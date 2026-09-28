@@ -16,8 +16,9 @@ use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag};
 use alloy_primitives::{Address, BlockHash, BlockNumber, Bytes, TxHash, TxNumber, B256};
 use alloy_rpc_types_engine::ForkchoiceState;
 use reth_chain_state::{
-    BlockState, CanonicalInMemoryState, ExecutedBlock, ForkChoiceNotifications,
-    ForkChoiceSubscriptions, PersistedBlockNotifications, PersistedBlockSubscriptions,
+    BlockState, CanonicalInMemoryState, CanonicalStateProvider, ExecutedBlock,
+    ForkChoiceNotifications, ForkChoiceSubscriptions, PersistedBlockNotifications,
+    PersistedBlockSubscriptions,
 };
 use reth_chainspec::ChainInfo;
 use reth_db_api::models::{AccountBeforeTx, BlockNumberAddress, StoredBlockBodyIndices};
@@ -140,6 +141,11 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
     pub fn canonical_in_memory_state(&self) -> CanonicalInMemoryState<N::Primitives> {
         self.canonical_in_memory_state.clone()
     }
+
+    // The trait form of the method above lives in the `CanonicalStateProvider` impl
+    // further down this file. The inherent method is kept because it is used widely
+    // inside this crate, where the concrete type is already known and importing a
+    // trait to call it would be noise.
 
     /// Returns a provider with a created `DbTx` inside, which allows fetching data from the
     /// database using different types of providers. Example: [`HeaderProvider`]
@@ -912,6 +918,20 @@ where
 
     fn header_by_id(&self, id: BlockId) -> ProviderResult<Option<Self::Header>> {
         self.consistent_provider()?.header_by_id(id)
+    }
+}
+
+/// Hands the engine the in-memory state this provider itself reads from.
+///
+/// The clone is a shared handle, so writes the engine makes through it (canonical head,
+/// safe/finalized markers, the in-memory block set) are immediately visible to this
+/// provider's own `latest`/`pending`/`safe`/`finalized` queries. That shared-ness is the
+/// contract; see [`CanonicalStateProvider`].
+impl<N: ProviderNodeTypes> CanonicalStateProvider for BlockchainProvider<N> {
+    type Primitives = N::Primitives;
+
+    fn canonical_in_memory_state(&self) -> CanonicalInMemoryState<Self::Primitives> {
+        Self::canonical_in_memory_state(self)
     }
 }
 
