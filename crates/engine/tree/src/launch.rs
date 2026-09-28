@@ -43,50 +43,11 @@ pub type EngineOrchestrator<T, N, Client, S, B> = ChainOrchestrator<
 
 /// How the engine obtains its [`PersistenceHandle`].
 ///
-/// The persistence service is the only writer of committed chain data. reth's own service
-/// writes through a [`ProviderFactory`] into MDBX, static files and `RocksDB`; a node built
-/// on a different storage engine needs to write somewhere else entirely, so it runs its own
-/// service and passes the handle in.
-///
-/// # Example
-///
-/// Running reth's service, which is what every stock node does:
-///
-/// ```ignore
-/// EnginePersistence::Default { provider: provider_factory, pruner }
-/// ```
-///
-/// Running your own — spawn a thread that drains [`PersistenceAction`]s and writes them
-/// wherever you keep state, then hand the engine the sending half:
-///
-/// ```ignore
-/// use reth_engine_tree::persistence::{PersistenceAction, PersistenceHandle};
-///
-/// let (tx, rx) = std::sync::mpsc::channel::<PersistenceAction<EthPrimitives>>();
-/// std::thread::spawn(move || {
-///     while let Ok(action) = rx.recv() {
-///         match action {
-///             PersistenceAction::SaveBlocks(input, reply) => {
-///                 // `input` exposes the blocks and both persistence frontiers through
-///                 // its accessors: `persist_rest_blocks()`, `state_trie_blocks()`,
-///                 // `last_block()`. Write them, then report the new tip back.
-///                 let _ = reply.send(my_store.save(&input));
-///             }
-///             // `RemoveBlocksAbove`, `SaveFinalizedBlock`, `SaveSafeBlock`, ...
-///             _ => {}
-///         }
-///     }
-/// });
-///
-/// EnginePersistence::External(PersistenceHandle::new(tx))
-/// ```
-///
-/// The engine treats a `SaveBlocks` reply as durable. A service that acknowledges before the
-/// write is durable will silently lose the tail of the chain on a crash.
-///
-/// [`PersistenceAction`]: crate::persistence::PersistenceAction
-// One of these is constructed once per node launch, so the size gap between a provider
-// factory plus pruner and a bare channel handle costs nothing.
+/// [`Default`](Self::Default) spawns reth's own service, which writes through a
+/// [`ProviderFactory`]. [`External`](Self::External) takes a handle to a service the
+/// caller spawned (see [`PersistenceHandle::new`]) — for a node whose committed state
+/// does not live in MDBX. The engine treats a `SaveBlocks` reply as durable.
+// Built once per node launch, so the size gap between the variants costs nothing.
 #[expect(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum EnginePersistence<N: ProviderNodeTypes> {
@@ -97,16 +58,12 @@ pub enum EnginePersistence<N: ProviderNodeTypes> {
         /// Pruner run by the persistence service.
         pruner: PrunerWithFactory<ProviderFactory<N>>,
     },
-    /// Use a persistence service the caller has already spawned.
-    ///
-    /// Nothing else in the engine writes committed data, so the caller owns durability,
-    /// pruning and crash recovery for whatever store sits behind this handle.
+    /// Use a persistence service the caller has already spawned, and owns durability,
+    /// pruning and crash recovery for.
     External(PersistenceHandle<N::Primitives>),
 }
 
 impl<N: ProviderNodeTypes> EnginePersistence<N> {
-    /// Returns the handle, spawning reth's service first if this is
-    /// [`Default`](Self::Default).
     fn into_handle(self, sync_metrics_tx: MetricEventsSender) -> PersistenceHandle<N::Primitives> {
         match self {
             Self::Default { provider, pruner } => {
@@ -154,10 +111,7 @@ where
     pub pipeline_task_spawner: Runtime,
     /// How the engine gets its persistence service. See [`EnginePersistence`].
     pub persistence: EnginePersistence<N>,
-    /// Provider backing the engine tree.
-    ///
-    /// `BlockchainProvider` for a stock node; any `P` meeting the bounds on
-    /// [`build`](Self::build) for a node on different storage.
+    /// Provider backing the engine tree; see [`build`](Self::build) for its bounds.
     pub blockchain_db: P,
     /// Handle to the payload builder service.
     pub payload_builder: PayloadBuilderHandle<N::Payload>,
@@ -178,10 +132,8 @@ where
 impl<N, P, Client, S, V, C> EngineOrchestratorBuilder<N, P, Client, S, V, C>
 where
     N: ProviderNodeTypes,
-    // These are exactly the bounds `EngineApiTreeHandler` already required of its
-    // provider, plus `CanonicalStateProvider` for the one call `build` makes itself.
-    // Nothing here is new: the tree was always generic, this builder just named
-    // `BlockchainProvider` instead of repeating the bounds.
+    // `EngineApiTreeHandler`'s own bounds, plus `CanonicalStateProvider` for the one
+    // call `build` makes itself.
     P: DatabaseProviderFactory
         + BlockReader<
             Block = <N::Primitives as NodePrimitives>::Block,
@@ -234,8 +186,6 @@ where
 
         let persistence_handle = persistence.into_handle(sync_metrics_tx);
 
-        // The one call that used to force `blockchain_db` to be a concrete
-        // `BlockchainProvider`. It is now a trait method, so any provider can answer it.
         let canonical_in_memory_state = blockchain_db.canonical_in_memory_state();
 
         let (to_tree_tx, from_tree) = EngineApiTreeHandler::spawn_new(

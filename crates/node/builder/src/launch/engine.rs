@@ -48,41 +48,12 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-/// Builds the provider the engine will run on, given the node's [`ProviderFactory`].
+/// Builds the provider the engine runs on.
 ///
-/// The launcher cannot simply *accept* a provider: a provider needs a [`ProviderFactory`],
-/// which needs an open database, which needs the datadir and config that only the launcher
-/// has. So the launcher constructs the provider partway through, and this trait is how a
-/// caller says *what* to construct.
-///
-/// # Example
-///
-/// A provider backed by something other than MDBX. The factory argument is still handed to
-/// you — ignore it if your provider does not need one:
-///
-/// ```ignore
-/// use reth_node_builder::{EngineNodeLauncher, EngineProviderBuilder};
-///
-/// struct MyProviderBuilder {
-///     store: MyStoreHandle,
-/// }
-///
-/// impl<N: ProviderNodeTypes> EngineProviderBuilder<N> for MyProviderBuilder {
-///     type Provider = MyProvider;
-///
-///     fn build_provider(self, _factory: ProviderFactory<N>) -> eyre::Result<Self::Provider> {
-///         Ok(MyProvider::new(self.store))
-///     }
-/// }
-///
-/// // `with_types_and_provider::<MyNode, MyProvider>()` on the node builder is what makes
-/// // `T::Provider` be `MyProvider`; this makes the launcher actually build one.
-/// let launcher = EngineNodeLauncher::new(executor, datadir, tree_config)
-///     .with_provider_builder(MyProviderBuilder { store });
-/// ```
-///
-/// `Self::Provider` must be the same type as `T::Provider` for the node types you launch,
-/// or the launch will not compile.
+/// The launcher cannot just *accept* a provider: one needs a [`ProviderFactory`], which
+/// needs an open database, which needs the datadir only the launcher has. So the launcher
+/// constructs it, and this says what to construct. `Self::Provider` must be the same type
+/// as `T::Provider` for the node types being launched.
 pub trait EngineProviderBuilder<N: ProviderNodeTypes>: Send {
     /// The provider this builds.
     type Provider;
@@ -91,8 +62,7 @@ pub trait EngineProviderBuilder<N: ProviderNodeTypes>: Send {
     fn build_provider(self, factory: ProviderFactory<N>) -> eyre::Result<Self::Provider>;
 }
 
-/// The default [`EngineProviderBuilder`]: reth's own [`BlockchainProvider`] over MDBX,
-/// static files and `RocksDB`. This is what every stock node uses.
+/// The default [`EngineProviderBuilder`]: reth's own [`BlockchainProvider`].
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
 pub struct BlockchainProviderBuilder;
@@ -107,8 +77,7 @@ impl<N: ProviderNodeTypes> EngineProviderBuilder<N> for BlockchainProviderBuilde
 
 /// The engine node launcher.
 ///
-/// `PB` selects the provider the engine runs on and defaults to
-/// [`BlockchainProviderBuilder`], so existing callers are unaffected. Swap it with
+/// `PB` selects the provider the engine runs on; swap it with
 /// [`with_provider_builder`](Self::with_provider_builder).
 #[derive(Debug)]
 pub struct EngineNodeLauncher<PB = BlockchainProviderBuilder> {
@@ -141,8 +110,7 @@ impl EngineNodeLauncher {
 impl<PB> EngineNodeLauncher<PB> {
     /// Run the engine on a provider of your own instead of [`BlockchainProvider`].
     ///
-    /// See [`EngineProviderBuilder`] for what the builder has to do and the matching
-    /// `NodeBuilder::with_types_and_provider` call that makes the types line up.
+    /// Pair with `NodeBuilder::with_types_and_provider`, which sets `T::Provider`.
     pub fn with_provider_builder<NewPB>(
         self,
         provider_builder: NewPB,
@@ -161,11 +129,9 @@ impl<PB> EngineNodeLauncher<PB> {
     where
         N: Node<RethFullAdapter<DB, N>> + NodeTypesForProvider,
         DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
-        // `Provider` used to be pinned to `BlockchainProvider` here. It is now whatever
-        // the node types declare. `FullProvider` (which `FullNodeTypes` already requires)
-        // supplies all the traits below; what it does not do is pin their associated
-        // types to this node's primitives -- being concrete used to do that. Spelling the
-        // equalities out is what replaces it.
+        // `FullProvider` already supplies these traits; what it does not do is pin their
+        // associated types to this node's primitives, which naming a concrete provider
+        // used to. Hence the equalities.
         T: FullNodeTypes<Types = N, DB = DB>,
         T::Provider: CanonicalStateProvider<Primitives = <N as NodeTypes>::Primitives>
             + CanonChainTracker
@@ -174,7 +140,6 @@ impl<PB> EngineNodeLauncher<PB> {
             Block = <<N as NodeTypes>::Primitives as NodePrimitives>::Block,
             Header = <<N as NodeTypes>::Primitives as NodePrimitives>::BlockHeader,
         >,
-        // The provider builder must produce exactly the provider the node types name.
         PB: EngineProviderBuilder<
             NodeTypesWithDBAdapter<N, DB>,
             Provider = <T as FullNodeTypes>::Provider,
@@ -235,8 +200,6 @@ impl<PB> EngineNodeLauncher<PB> {
             .with_metrics_task()
             // passing FullNodeTypes as type parameter here so that we can build
             // later the components.
-            // Was `BlockchainProvider::new(provider_factory)` inline. The closure's
-            // return type has always been `T::Provider`; only the body was fixed.
             .with_blockchain_db::<T, _>(move |provider_factory| {
                 provider_builder.build_provider(provider_factory)
             })?
@@ -355,8 +318,6 @@ impl<PB> EngineNodeLauncher<PB> {
             incoming_requests: Box::pin(consensus_engine_stream),
             pipeline,
             pipeline_task_spawner: ctx.task_executor().clone(),
-            // Stock nodes let reth run persistence over MDBX + static files. A node on
-            // other storage uses `EnginePersistence::External` with its own service.
             persistence: EnginePersistence::Default {
                 provider: ctx.provider_factory().clone(),
                 pruner,

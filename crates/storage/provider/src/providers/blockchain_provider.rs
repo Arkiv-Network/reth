@@ -142,11 +142,6 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
         self.canonical_in_memory_state.clone()
     }
 
-    // The trait form of the method above lives in the `CanonicalStateProvider` impl
-    // further down this file. The inherent method is kept because it is used widely
-    // inside this crate, where the concrete type is already known and importing a
-    // trait to call it would be noise.
-
     /// Returns a provider with a created `DbTx` inside, which allows fetching data from the
     /// database using different types of providers. Example: [`HeaderProvider`]
     /// [`BlockHashReader`]. This may fail if the inner read database transaction fails to open.
@@ -921,12 +916,6 @@ where
     }
 }
 
-/// Hands the engine the in-memory state this provider itself reads from.
-///
-/// The clone is a shared handle, so writes the engine makes through it (canonical head,
-/// safe/finalized markers, the in-memory block set) are immediately visible to this
-/// provider's own `latest`/`pending`/`safe`/`finalized` queries. That shared-ness is the
-/// contract; see [`CanonicalStateProvider`].
 impl<N: ProviderNodeTypes> CanonicalStateProvider for BlockchainProvider<N> {
     type Primitives = N::Primitives;
 
