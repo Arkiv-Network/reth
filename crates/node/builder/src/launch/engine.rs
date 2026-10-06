@@ -513,13 +513,24 @@ impl<PB> EngineNodeLauncher<PB> {
     }
 }
 
-impl<N, DB, T, CB, AO> LaunchNode<NodeBuilderWithComponents<T, CB, AO>> for EngineNodeLauncher
+// Generic over `PB`, matching `launch_node` above: without this, a launcher
+// built by `with_provider_builder` has no `LaunchNode` impl and cannot be
+// passed to `launch_with`, which makes the provider seam unreachable.
+impl<N, DB, T, CB, AO, PB> LaunchNode<NodeBuilderWithComponents<T, CB, AO>>
+    for EngineNodeLauncher<PB>
 where
-    T: FullNodeTypes<
-        Types = N,
-        DB = DB,
-        Provider = BlockchainProvider<NodeTypesWithDBAdapter<N, DB>>,
+    T: FullNodeTypes<Types = N, DB = DB>,
+    T::Provider: CanonicalStateProvider<Primitives = <N as NodeTypes>::Primitives>
+        + CanonChainTracker
+        + StateReader<Receipt = <<N as NodeTypes>::Primitives as NodePrimitives>::Receipt>,
+    <T::Provider as DatabaseProviderFactory>::Provider: BlockReader<
+        Block = <<N as NodeTypes>::Primitives as NodePrimitives>::Block,
+        Header = <<N as NodeTypes>::Primitives as NodePrimitives>::BlockHeader,
     >,
+    PB: EngineProviderBuilder<
+            NodeTypesWithDBAdapter<N, DB>,
+            Provider = <T as FullNodeTypes>::Provider,
+        > + 'static,
     N: Node<RethFullAdapter<DB, N>> + NodeTypesForProvider,
     DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
     CB: NodeComponentsBuilder<T> + 'static,
