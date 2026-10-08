@@ -291,12 +291,12 @@ where
                     block_available_gas,
                 ),
             );
-            continue
+            continue;
         }
 
         // check if the job was cancelled, if so we can exit early
         if cancel.is_cancelled() {
-            return Ok(BuildOutcome::Cancelled)
+            return Ok(BuildOutcome::Cancelled);
         }
 
         // convert tx to a signed transaction
@@ -315,7 +315,7 @@ where
                     limit: MAX_RLP_BLOCK_SIZE,
                 },
             );
-            continue
+            continue;
         }
 
         // There's only limited amount of blob space available per block, so we need to check if
@@ -339,14 +339,14 @@ where
                         },
                     ),
                 );
-                continue
+                continue;
             }
 
             let blob_sidecar_result = 'sidecar: {
                 let Some(sidecar) =
                     pool.get_blob(*tx.hash()).map_err(PayloadBuilderError::other)?
                 else {
-                    break 'sidecar Err(Eip4844PoolTransactionError::MissingEip4844BlobSidecar)
+                    break 'sidecar Err(Eip4844PoolTransactionError::MissingEip4844BlobSidecar);
                 };
 
                 if is_osaka {
@@ -366,7 +366,7 @@ where
                 Ok(sidecar) => Some(sidecar),
                 Err(error) => {
                     best_txs.mark_invalid(&pool_tx, InvalidPoolTransactionError::Eip4844(error));
-                    continue
+                    continue;
                 }
             };
         }
@@ -396,7 +396,7 @@ where
                         ),
                     );
                 }
-                continue
+                continue;
             }
             // The executor is the source of truth for block gas availability. Keep this
             // non-fatal in case local builder accounting diverges from executor rules.
@@ -414,7 +414,7 @@ where
                         block_available_gas,
                     ),
                 );
-                continue
+                continue;
             }
             // this is an error that we should treat as fatal for this attempt
             Err(err) => return Err(PayloadBuilderError::evm(err)),
@@ -451,7 +451,7 @@ where
         // Release db
         drop(builder);
         // can skip building the block
-        return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads })
+        return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads });
     }
 
     let BlockBuilderOutcome { execution_result, block, block_access_list, .. } = if skip_state_root
@@ -466,6 +466,27 @@ where
             state_provider.as_ref(),
             Some((parent_header.state_root(), Default::default())),
         )?
+    } else if let Some(resolver) = builder_config.state_root_resolver.clone() {
+        // The root is a product of execution, so it cannot be known until execution has ended —
+        // post-execution changes included. `finish_with` resolves it there rather than here.
+        let parent_hash = parent_header.hash();
+        let number = parent_header.number() + 1;
+        builder.finish_with(state_provider.as_ref(), move |transactions| {
+            let executed: Vec<_> =
+                transactions.iter().map(|tx| (tx.signer(), tx.nonce())).collect();
+            let request =
+                PayloadStateRootRequest { parent_hash, number, transactions: &executed };
+            match resolver(&request) {
+                Some(state_root) => {
+                    debug!(target: "payload_builder", id=%payload_id, ?state_root, "resolved payload state root from execution");
+                    Ok(Some((state_root, Default::default())))
+                }
+                None => {
+                    warn!(target: "payload_builder", id=%payload_id, ?number, "state-root resolver did not recognise this execution, falling back to sync state root");
+                    Ok(None)
+                }
+            }
+        })?
     } else if let Some(mut task) = state_root_handle {
         // Drop the state hook, which signals the state-root task to finalize.
         builder.evm_mut().db_mut().set_state_hook(None);
