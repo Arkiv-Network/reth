@@ -72,10 +72,10 @@ pub trait EngineProviderBuilder<N: ProviderNodeTypes>: Send {
     /// services running, every block is written to two stores, which can then
     /// disagree after a crash.
     ///
-    /// Takes the built provider, because that is the route to whatever the
-    /// node keeps its chain in.
+    /// Called once, before [`build_provider`](Self::build_provider), so the
+    /// service is running before the engine can send it anything.
     fn engine_persistence(
-        _provider: &Self::Provider,
+        &self,
     ) -> Option<reth_engine_tree::persistence::PersistenceHandle<N::Primitives>> {
         None
     }
@@ -182,6 +182,9 @@ impl<PB> EngineNodeLauncher<PB> {
             ctx.task_executor.state_trie_overlay_worker_pool(),
         );
         let disabled_stages = N::disabled_stages();
+        // Before the builder is moved into the closure below, and before the
+        // engine exists to send anything: see `EngineProviderBuilder::engine_persistence`.
+        let persistence_override = provider_builder.engine_persistence();
 
         // setup the launch context
         let ctx = ctx
@@ -341,7 +344,7 @@ impl<PB> EngineNodeLauncher<PB> {
             // own service here and owns durability for it; see
             // `Node::engine_persistence`. Running both would write every block
             // to two stores that can disagree after a crash.
-            persistence: match PB::engine_persistence(ctx.blockchain_db()) {
+            persistence: match persistence_override {
                 Some(handle) => EnginePersistence::External(handle),
                 None => EnginePersistence::Default {
                     provider: ctx.provider_factory().clone(),
