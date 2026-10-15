@@ -886,7 +886,7 @@ where
     /// If the database is empty, returns the genesis block.
     pub fn lookup_head(&self) -> eyre::Result<Head> {
         self.node_config()
-            .lookup_head(self.provider_factory())
+            .lookup_head(self.blockchain_db())
             .wrap_err("the head block is missing")
     }
 
