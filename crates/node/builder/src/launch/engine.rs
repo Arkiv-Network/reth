@@ -60,6 +60,25 @@ pub trait EngineProviderBuilder<N: ProviderNodeTypes>: Send {
 
     /// Construct the provider. Called once, during launch.
     fn build_provider(self, factory: ProviderFactory<N>) -> eyre::Result<Self::Provider>;
+
+    /// A persistence service for the engine to use instead of reth's own.
+    ///
+    /// `None`, the default, spawns the built-in service over the provider
+    /// factory, which writes blocks into reth's database.
+    ///
+    /// A provider whose chain lives elsewhere returns its own handle here and
+    /// takes on what the built-in service owns: durability, pruning and crash
+    /// recovery. That is what keeps a single record of the chain -- with both
+    /// services running, every block is written to two stores, which can then
+    /// disagree after a crash.
+    ///
+    /// Takes the built provider, because that is the route to whatever the
+    /// node keeps its chain in.
+    fn engine_persistence(
+        _provider: &Self::Provider,
+    ) -> Option<reth_engine_tree::persistence::PersistenceHandle<N::Primitives>> {
+        None
+    }
 }
 
 /// The default [`EngineProviderBuilder`]: reth's own [`BlockchainProvider`].
@@ -318,9 +337,16 @@ impl<PB> EngineNodeLauncher<PB> {
             incoming_requests: Box::pin(consensus_engine_stream),
             pipeline,
             pipeline_task_spawner: ctx.task_executor().clone(),
-            persistence: EnginePersistence::Default {
-                provider: ctx.provider_factory().clone(),
-                pruner,
+            // A node that keeps its chain outside reth's database supplies its
+            // own service here and owns durability for it; see
+            // `Node::engine_persistence`. Running both would write every block
+            // to two stores that can disagree after a crash.
+            persistence: match PB::engine_persistence(ctx.blockchain_db()) {
+                Some(handle) => EnginePersistence::External(handle),
+                None => EnginePersistence::Default {
+                    provider: ctx.provider_factory().clone(),
+                    pruner,
+                },
             },
             blockchain_db: ctx.blockchain_db().clone(),
             payload_builder: ctx.components().payload_builder_handle().clone(),
