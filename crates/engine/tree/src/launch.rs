@@ -13,6 +13,7 @@ use crate::{
     tree::{EngineApiTreeHandler, EngineValidator, TreeConfig, WaitForCaches},
 };
 use futures::Stream;
+use reth_chain_state::CanonicalStateProvider;
 use reth_consensus::FullConsensus;
 use reth_engine_primitives::BeaconEngineMessage;
 use reth_evm::ConfigureEvm;
@@ -20,8 +21,9 @@ use reth_network_p2p::{BlockAccessListsClient, BlockClient};
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_primitives_traits::NodePrimitives;
 use reth_provider::{
-    providers::{BlockchainProvider, ProviderNodeTypes},
-    ProviderFactory,
+    providers::ProviderNodeTypes, BalProvider, BlockReader, ChangeSetReader,
+    DatabaseProviderFactory, ProviderFactory, PruneCheckpointReader, StageCheckpointReader,
+    StateProviderFactory, StateReader, StorageChangeSetReader, StorageSettingsCache,
 };
 use reth_prune::PrunerWithFactory;
 use reth_stages_api::{MetricEventsSender, Pipeline};
@@ -38,6 +40,39 @@ pub type EngineOrchestrator<T, N, Client, S, B> = ChainOrchestrator<
     >,
     B,
 >;
+
+/// How the engine obtains its [`PersistenceHandle`].
+///
+/// [`Default`](Self::Default) spawns reth's own service, which writes through a
+/// [`ProviderFactory`]. [`External`](Self::External) takes a handle to a service the
+/// caller spawned (see [`PersistenceHandle::new`]) — for a node whose committed state
+/// does not live in MDBX. The engine treats a `SaveBlocks` reply as durable.
+// Built once per node launch, so the size gap between the variants costs nothing.
+#[expect(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum EnginePersistence<N: ProviderNodeTypes> {
+    /// Spawn reth's built-in persistence service over the given provider factory.
+    Default {
+        /// Provider factory handed to the persistence service.
+        provider: ProviderFactory<N>,
+        /// Pruner run by the persistence service.
+        pruner: PrunerWithFactory<ProviderFactory<N>>,
+    },
+    /// Use a persistence service the caller has already spawned, and owns durability,
+    /// pruning and crash recovery for.
+    External(PersistenceHandle<N::Primitives>),
+}
+
+impl<N: ProviderNodeTypes> EnginePersistence<N> {
+    fn into_handle(self, sync_metrics_tx: MetricEventsSender) -> PersistenceHandle<N::Primitives> {
+        match self {
+            Self::Default { provider, pruner } => {
+                PersistenceHandle::<N::Primitives>::spawn_service(provider, pruner, sync_metrics_tx)
+            }
+            Self::External(handle) => handle,
+        }
+    }
+}
 
 /// Components needed to build the engine [`ChainOrchestrator`] that drives the chain forward.
 ///
@@ -58,7 +93,7 @@ pub type EngineOrchestrator<T, N, Client, S, B> = ChainOrchestrator<
 ///
 /// [`ChainEvent`]: crate::chain::ChainEvent
 #[derive(Debug)]
-pub struct EngineOrchestratorBuilder<N, Client, S, V, C>
+pub struct EngineOrchestratorBuilder<N, P, Client, S, V, C>
 where
     N: ProviderNodeTypes,
 {
@@ -74,12 +109,10 @@ where
     pub pipeline: Pipeline<N>,
     /// Runtime the pipeline runs on.
     pub pipeline_task_spawner: Runtime,
-    /// Provider factory handed to the persistence service.
-    pub provider: ProviderFactory<N>,
-    /// Blockchain provider backing the engine tree.
-    pub blockchain_db: BlockchainProvider<N>,
-    /// Pruner run by the persistence service.
-    pub pruner: PrunerWithFactory<ProviderFactory<N>>,
+    /// How the engine gets its persistence service. See [`EnginePersistence`].
+    pub persistence: EnginePersistence<N>,
+    /// Provider backing the engine tree; see [`build`](Self::build) for its bounds.
+    pub blockchain_db: P,
     /// Handle to the payload builder service.
     pub payload_builder: PayloadBuilderHandle<N::Payload>,
     /// Validator for incoming payloads.
@@ -96,9 +129,30 @@ where
     pub runtime: Runtime,
 }
 
-impl<N, Client, S, V, C> EngineOrchestratorBuilder<N, Client, S, V, C>
+impl<N, P, Client, S, V, C> EngineOrchestratorBuilder<N, P, Client, S, V, C>
 where
     N: ProviderNodeTypes,
+    // `EngineApiTreeHandler`'s own bounds, plus `CanonicalStateProvider` for the one
+    // call `build` makes itself.
+    P: DatabaseProviderFactory
+        + BlockReader<
+            Block = <N::Primitives as NodePrimitives>::Block,
+            Header = <N::Primitives as NodePrimitives>::BlockHeader,
+        > + StateProviderFactory
+        + StateReader<Receipt = <N::Primitives as NodePrimitives>::Receipt>
+        + BalProvider
+        + CanonicalStateProvider<Primitives = N::Primitives>
+        + Clone
+        + 'static,
+    P::Provider: BlockReader<
+            Block = <N::Primitives as NodePrimitives>::Block,
+            Header = <N::Primitives as NodePrimitives>::BlockHeader,
+        > + PruneCheckpointReader
+        + StageCheckpointReader
+        + ChangeSetReader
+        + StorageChangeSetReader
+        + StorageSettingsCache
+        + 'static,
     Client: BlockClient<Block = <N::Primitives as NodePrimitives>::Block>
         + BlockAccessListsClient
         + 'static,
@@ -117,9 +171,8 @@ where
             incoming_requests,
             pipeline,
             pipeline_task_spawner,
-            provider,
+            persistence,
             blockchain_db,
-            pruner,
             payload_builder,
             payload_validator,
             overlay_manager,
@@ -131,8 +184,7 @@ where
 
         let downloader = BasicBlockDownloader::new(client, consensus.clone());
 
-        let persistence_handle =
-            PersistenceHandle::<N::Primitives>::spawn_service(provider, pruner, sync_metrics_tx);
+        let persistence_handle = persistence.into_handle(sync_metrics_tx);
 
         let canonical_in_memory_state = blockchain_db.canonical_in_memory_state();
 
