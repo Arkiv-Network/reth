@@ -35,12 +35,21 @@ use std::{
 };
 use tracing::{debug, trace};
 
+/// Where the durable frontiers come from, when not the database.
+///
+/// Returns `(partial state trie, finish)`. A node that keeps its committed
+/// chain outside reth's database installs one of these, because the stage
+/// checkpoints the database answers with were never written.
+pub type StateFrontiers =
+    Arc<dyn Fn() -> ProviderResult<(BlockNumHash, BlockNumHash)> + Send + Sync>;
+
 /// Manages state trie and execution overlays for in-memory blocks.
 ///
 /// The manager owns the in-memory block graph, changeset cache, and caches keyed by
 /// `(anchor_hash, tip_hash)`.
 #[derive(Clone)]
 pub struct OverlayManager<N: NodePrimitives = EthPrimitives> {
+    frontiers: Arc<OnceLock<StateFrontiers>>,
     blocks: Arc<DashMap<B256, ExecutedBlock<N>>>,
     state_trie_overlays: OverlayCache<TrieInputSorted>,
     execution_overlays: OverlayCache<ExecutionOverlay>,
@@ -55,6 +64,7 @@ pub struct OverlayManager<N: NodePrimitives = EthPrimitives> {
 impl<N: NodePrimitives> Default for OverlayManager<N> {
     fn default() -> Self {
         Self {
+            frontiers: Default::default(),
             blocks: Default::default(),
             state_trie_overlays: Default::default(),
             execution_overlays: Default::default(),
@@ -124,6 +134,28 @@ impl<N: NodePrimitives> OverlayManager<N> {
         &self.changeset_cache
     }
 
+    /// Answer the durable frontiers from `source` rather than from the database.
+    ///
+    /// Set once, at launch, before the engine runs. Returns the source back if
+    /// one was already installed.
+    pub fn set_state_frontiers(&self, source: StateFrontiers) -> Result<(), StateFrontiers> {
+        self.frontiers.set(source)
+    }
+
+    /// The durable frontiers: from the installed source, else from the database.
+    ///
+    /// Every overlay decision anchors on these, so this is the one place that
+    /// decides whether reth's own stage checkpoints are the authority.
+    pub fn state_frontiers<P>(&self, provider: &P) -> ProviderResult<(BlockNumHash, BlockNumHash)>
+    where
+        P: StageCheckpointReader + BlockNumReader,
+    {
+        match self.frontiers.get() {
+            Some(source) => source(),
+            None => database_state_frontiers(provider),
+        }
+    }
+
     /// Gets or computes cached changesets for an inclusive block range.
     pub fn get_or_compute_cached_changesets_range<P>(
         &self,
@@ -139,7 +171,7 @@ impl<N: NodePrimitives> OverlayManager<N> {
             + BlockNumReader
             + StorageSettingsCache,
     {
-        let (partial_state_trie, finish) = database_state_frontiers(provider)?;
+        let (partial_state_trie, finish) = self.state_frontiers(provider)?;
         self.get_or_compute_cached_changesets_range_at_frontiers(
             provider,
             range,

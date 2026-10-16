@@ -7,7 +7,9 @@
 //! - **Reorg support**: Quickly access changesets to revert blocks during chain reorganizations
 //! - **Memory efficiency**: Explicit eviction releases persisted changesets
 
-use crate::{database_state_frontiers, OverlayManager, OverlayStateProvider};
+#[cfg(test)]
+use crate::database_state_frontiers;
+use crate::{OverlayManager, OverlayStateProvider};
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{map::B256Map, BlockNumber, B256};
 use parking_lot::RwLock;
@@ -102,7 +104,7 @@ where
 {
     let tx = provider.tx_ref();
     let cache = overlay_manager.changeset_cache();
-    let (partial_state_trie, finish) = database_state_frontiers(provider)?;
+    let (partial_state_trie, finish) = overlay_manager.state_frontiers(provider)?;
 
     // Step 1: Get the trie changesets for the target block from cache
     let changesets = cache.get_or_compute(

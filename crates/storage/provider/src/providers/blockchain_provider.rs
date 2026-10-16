@@ -16,8 +16,9 @@ use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag};
 use alloy_primitives::{Address, BlockHash, BlockNumber, Bytes, TxHash, TxNumber, B256};
 use alloy_rpc_types_engine::ForkchoiceState;
 use reth_chain_state::{
-    BlockState, CanonicalInMemoryState, ExecutedBlock, ForkChoiceNotifications,
-    ForkChoiceSubscriptions, PersistedBlockNotifications, PersistedBlockSubscriptions,
+    BlockState, CanonicalInMemoryState, CanonicalStateProvider, ExecutedBlock,
+    ForkChoiceNotifications, ForkChoiceSubscriptions, PersistedBlockNotifications,
+    PersistedBlockSubscriptions,
 };
 use reth_chainspec::ChainInfo;
 use reth_db_api::models::{AccountBeforeTx, BlockNumberAddress, StoredBlockBodyIndices};
@@ -912,6 +913,14 @@ where
 
     fn header_by_id(&self, id: BlockId) -> ProviderResult<Option<Self::Header>> {
         self.consistent_provider()?.header_by_id(id)
+    }
+}
+
+impl<N: ProviderNodeTypes> CanonicalStateProvider for BlockchainProvider<N> {
+    type Primitives = N::Primitives;
+
+    fn canonical_in_memory_state(&self) -> CanonicalInMemoryState<Self::Primitives> {
+        Self::canonical_in_memory_state(self)
     }
 }
 

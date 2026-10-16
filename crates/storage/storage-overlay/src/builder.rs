@@ -233,6 +233,11 @@ pub struct OverlayBuilder<N: NodePrimitives = EthPrimitives> {
 }
 
 impl<N: NodePrimitives> OverlayBuilder<N> {
+    /// The manager this builder resolves against.
+    pub const fn overlay_manager(&self) -> &OverlayManager<N> {
+        &self.overlay_manager
+    }
+
     /// Create a new manager-backed overlay builder.
     pub(crate) fn new(
         parent_hash: B256,
