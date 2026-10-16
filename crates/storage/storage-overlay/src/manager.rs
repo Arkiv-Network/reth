@@ -20,6 +20,7 @@ use reth_primitives_traits::{
     dashmap::{mapref::entry::Entry, DashMap},
     AlloyBlockHeader, FastInstant, NodePrimitives,
 };
+use reth_storage_api::EvmStateProviderBox;
 use reth_storage_api::{
     BlockNumReader, ChangeSetReader, DBProvider, PruneCheckpointReader, StageCheckpointReader,
     StorageChangeSetReader, StorageSettingsCache,
@@ -43,6 +44,13 @@ use tracing::{debug, trace};
 pub type StateFrontiers =
     Arc<dyn Fn() -> ProviderResult<(BlockNumHash, BlockNumHash)> + Send + Sync>;
 
+/// Where the state EVM execution reads comes from, when not the database.
+///
+/// Takes the parent block the execution is against. A node that keeps its
+/// committed chain outside reth's database installs one of these, because the
+/// database it would otherwise be read from is one this node never writes.
+pub type EvmState = Arc<dyn Fn(B256) -> ProviderResult<EvmStateProviderBox> + Send + Sync>;
+
 /// Manages state trie and execution overlays for in-memory blocks.
 ///
 /// The manager owns the in-memory block graph, changeset cache, and caches keyed by
@@ -50,6 +58,7 @@ pub type StateFrontiers =
 #[derive(Clone)]
 pub struct OverlayManager<N: NodePrimitives = EthPrimitives> {
     frontiers: Arc<OnceLock<StateFrontiers>>,
+    evm_state: Arc<OnceLock<EvmState>>,
     blocks: Arc<DashMap<B256, ExecutedBlock<N>>>,
     state_trie_overlays: OverlayCache<TrieInputSorted>,
     execution_overlays: OverlayCache<ExecutionOverlay>,
@@ -65,6 +74,7 @@ impl<N: NodePrimitives> Default for OverlayManager<N> {
     fn default() -> Self {
         Self {
             frontiers: Default::default(),
+            evm_state: Default::default(),
             blocks: Default::default(),
             state_trie_overlays: Default::default(),
             execution_overlays: Default::default(),
@@ -94,6 +104,7 @@ impl<N: NodePrimitives> OverlayManager<N> {
     pub fn new(worker_pool: Arc<WorkerPool>) -> Self {
         Self {
             frontiers: Default::default(),
+            evm_state: Default::default(),
             blocks: Default::default(),
             state_trie_overlays: Default::default(),
             execution_overlays: Default::default(),
@@ -133,6 +144,19 @@ impl<N: NodePrimitives> OverlayManager<N> {
 
     pub(crate) const fn changeset_cache(&self) -> &ChangesetCache {
         &self.changeset_cache
+    }
+
+    /// Answer EVM execution reads from `source` rather than from the database.
+    ///
+    /// Set once, at launch, before the engine runs. Returns the source back if
+    /// one was already installed.
+    pub fn set_evm_state(&self, source: EvmState) -> Result<(), EvmState> {
+        self.evm_state.set(source)
+    }
+
+    /// The installed EVM state source, if a node supplied one.
+    pub fn evm_state(&self) -> Option<&EvmState> {
+        self.evm_state.get()
     }
 
     /// Answer the durable frontiers from `source` rather than from the database.

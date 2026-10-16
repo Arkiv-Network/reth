@@ -600,8 +600,17 @@ where
     /// Creates a per-thread EVM for prewarming.
     #[instrument(level = "debug", target = "engine::tree::payload_processor::prewarm", skip_all)]
     fn evm_for_ctx(&self) -> PrewarmEvmState<Evm> {
-        let mut state_provider = match self.provider.database_provider_ro() {
-            Ok(provider) => Box::new(provider.into_evm_state_provider()) as EvmStateProviderBox,
+        // The node's own state when it supplies it; see
+        // `OverlayStateProviderFactory::node_evm_state_provider`.
+        let from_node = self.provider.node_evm_state_provider();
+        let mut state_provider = match from_node
+            .map_or_else(
+                || self.provider.database_provider_ro().map(|p| {
+                    Box::new(p.into_evm_state_provider()) as EvmStateProviderBox
+                }),
+                |provider| provider,
+            ) {
+            Ok(provider) => provider,
             Err(err) => {
                 trace!(
                     target: "engine::tree::payload_processor::prewarm",
