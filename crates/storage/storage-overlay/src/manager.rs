@@ -93,6 +93,7 @@ impl<N: NodePrimitives> OverlayManager<N> {
     #[cfg(feature = "rayon")]
     pub fn new(worker_pool: Arc<WorkerPool>) -> Self {
         Self {
+            frontiers: Default::default(),
             blocks: Default::default(),
             state_trie_overlays: Default::default(),
             execution_overlays: Default::default(),
