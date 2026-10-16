@@ -1,4 +1,4 @@
-use crate::{database_state_frontiers, ExecutionOverlay, OverlayBuilder, StateTrieOverlay};
+use crate::{ExecutionOverlay, OverlayBuilder, OverlayManager, StateTrieOverlay};
 use alloy_primitives::{Address, BlockHash, BlockNumber, B256, U256};
 use metrics::{Counter, Histogram};
 use reth_db_api::{cursor::DbDupCursorRO, tables, transaction::DbTx, DatabaseError};
@@ -237,6 +237,14 @@ where
         &self.provider
     }
 
+    /// The manager whose frontier source decides what counts as durable.
+    fn overlay_manager_ref(&self) -> &OverlayManager<N> {
+        self.overlay_builder
+            .as_ref()
+            .expect("overlay builder must be initialized or lazily resolvable")
+            .overlay_manager()
+    }
+
     fn state_trie_overlay(&self, trie_changesets: bool) -> ProviderResult<&StateTrieOverlay>
     where
         Provider::Target: StageCheckpointReader
@@ -252,7 +260,7 @@ where
             return Ok(overlay)
         }
 
-        let (state_trie_tip_block, finish_tip_block) = database_state_frontiers(self.provider())?;
+        let (state_trie_tip_block, finish_tip_block) = self.overlay_manager_ref().state_frontiers(self.provider())?;
         let overlay = match self.state_trie_overlay_cache.entry((
             state_trie_tip_block.hash,
             finish_tip_block.hash,
@@ -338,7 +346,7 @@ where
             return Ok((&overlay.overlay, overlay.historical_fallback.as_ref()))
         }
 
-        let (state_trie_tip_block, finish_tip_block) = database_state_frontiers(self.provider())?;
+        let (state_trie_tip_block, finish_tip_block) = self.overlay_manager_ref().state_frontiers(self.provider())?;
         let (overlay, fallback_block_number) = self
             .overlay_builder
             .as_ref()
