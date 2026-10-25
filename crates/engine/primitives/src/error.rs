@@ -90,6 +90,14 @@ pub enum InsertBlockErrorKind {
 }
 
 impl InsertBlockErrorKind {
+    /// Returns whether the error reports that the state of the block's parent is not ready yet.
+    ///
+    /// Such a block is not invalid and its processing did not fail: it is kept and executed again
+    /// once its parent becomes canonical. See [`ProviderError::ParentStateNotReady`].
+    pub const fn is_parent_state_not_ready(&self) -> bool {
+        matches!(self, Self::Provider(ProviderError::ParentStateNotReady(_)))
+    }
+
     /// Returns whether the error must be reported as an invalid payload.
     pub const fn is_validation_error(&self) -> bool {
         matches!(
@@ -215,5 +223,17 @@ mod tests {
                 .ensure_validation_error(),
             Err(InsertBlockProcessingError::Fatal(InsertBlockFatalError::Provider(_)))
         ));
+    }
+
+    #[test]
+    fn parent_state_not_ready_is_not_a_validation_error() {
+        let err = InsertBlockErrorKind::Provider(ProviderError::ParentStateNotReady(
+            alloy_primitives::B256::ZERO,
+        ));
+        assert!(err.is_parent_state_not_ready());
+        assert!(!err.is_validation_error());
+
+        assert!(!InsertBlockErrorKind::Provider(ProviderError::BestBlockNotFound)
+            .is_parent_state_not_ready());
     }
 }

@@ -369,6 +369,23 @@ pub struct EngineArgs {
     )]
     pub backfill_run_threshold: u64,
 
+    /// Never run the pipeline (backfill) to close a gap; download the missing blocks instead,
+    /// however large the gap is.
+    ///
+    /// Downloads are requested in ranges of at most 1024 blocks, and the downloaded blocks wait
+    /// in the block buffer until the gap is closed, so `--engine.block-buffer-limit` should be
+    /// large enough to hold the largest expected gap.
+    #[arg(long = "engine.disable-backfill", default_value_t = false)]
+    pub disable_backfill: bool,
+
+    /// Configure how many blocks that cannot be executed yet, for example because their parent is
+    /// still missing, are kept in the block buffer.
+    ///
+    /// If omitted, the default limit applies, raised to twice `--engine.backfill-threshold` when
+    /// that is larger.
+    #[arg(long = "engine.block-buffer-limit")]
+    pub block_buffer_limit: Option<u32>,
+
     /// Configure how many cache hits an invalid header can accumulate before it is evicted and
     /// reprocessed.
     ///
@@ -647,6 +664,8 @@ impl Default for EngineArgs {
             num_state_masking_blocks,
             memory_block_buffer_target: None,
             backfill_run_threshold,
+            disable_backfill: false,
+            block_buffer_limit: None,
             invalid_header_hit_eviction_threshold,
             state_root_task_compare_updates,
             legacy_state_root_task_enabled: false,
@@ -794,7 +813,12 @@ impl EngineArgs {
             .with_suppress_persistence_during_build(self.suppress_persistence_during_build)
             .without_bal_parallel_execution(self.bal_parallel_execution_disabled)
             .without_bal_parallel_state_root(self.bal_parallel_state_root_disabled)
-            .without_bal_batch_io(self.disable_bal_batch_io);
+            .without_bal_batch_io(self.disable_bal_batch_io)
+            .with_disable_backfill(self.disable_backfill);
+        let config = match self.block_buffer_limit {
+            Some(limit) => config.with_block_buffer_limit(limit),
+            None => config,
+        };
         #[cfg(feature = "trie-debug")]
         let config = config.with_proof_jitter(self.proof_jitter);
         config
@@ -948,6 +972,8 @@ mod tests {
             num_state_masking_blocks: DEFAULT_NUM_STATE_MASKING_BLOCKS,
             memory_block_buffer_target: Some(50),
             backfill_run_threshold: 100,
+            disable_backfill: true,
+            block_buffer_limit: Some(100_000),
             invalid_header_hit_eviction_threshold: 7,
             legacy_state_root_task_enabled: true,
             caching_and_prewarming_enabled: true,
@@ -996,6 +1022,9 @@ mod tests {
             "50",
             "--engine.backfill-threshold",
             "100",
+            "--engine.disable-backfill",
+            "--engine.block-buffer-limit",
+            "100000",
             "--engine.invalid-header-cache-hit-eviction-threshold",
             "7",
             "--engine.legacy-state-root",
@@ -1032,6 +1061,36 @@ mod tests {
         .args;
 
         assert_eq!(parsed_args, args);
+    }
+
+    #[test]
+    fn backfill_and_block_buffer_flags_reach_tree_config() {
+        let config = CommandParser::<EngineArgs>::parse_from(["reth"]).args.tree_config();
+        assert!(!config.disable_backfill());
+        assert_eq!(config.block_buffer_limit(), TreeConfig::default().block_buffer_limit());
+
+        let config = CommandParser::<EngineArgs>::parse_from([
+            "reth",
+            "--engine.disable-backfill",
+            "--engine.block-buffer-limit",
+            "100000",
+        ])
+        .args
+        .tree_config();
+        assert!(config.disable_backfill());
+        assert_eq!(config.block_buffer_limit(), 100_000);
+
+        // An explicit limit wins over the growth implied by the backfill threshold.
+        let config = CommandParser::<EngineArgs>::parse_from([
+            "reth",
+            "--engine.backfill-threshold",
+            "1000",
+            "--engine.block-buffer-limit",
+            "64",
+        ])
+        .args
+        .tree_config();
+        assert_eq!(config.block_buffer_limit(), 64);
     }
 
     #[test]

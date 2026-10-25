@@ -7,7 +7,10 @@ use crate::{
 };
 use alloy_consensus::BlockHeader;
 use alloy_eips::{eip1898::BlockWithParent, BlockNumHash, NumHash};
-use alloy_primitives::{map::B256Map, B256};
+use alloy_primitives::{
+    map::{B256Map, B256Set},
+    B256,
+};
 use alloy_rpc_types_engine::{
     ForkchoiceState, PayloadStatus, PayloadStatusEnum, PayloadValidationError,
 };
@@ -20,7 +23,7 @@ use reth_chain_state::{
 use reth_consensus::{Consensus, FullConsensus};
 use reth_engine_primitives::{
     BeaconEngineMessage, ConsensusEngineEvent, ExecutionPayload, ForkchoiceStateTracker,
-    NewPayloadTimings, OnForkChoiceUpdated, SlowBlockInfo,
+    NewPayloadTimings, OnForkChoiceUpdated, SlowBlockInfo, MAX_BLOCK_RANGE_DOWNLOAD,
 };
 use reth_errors::{ConsensusError, ProviderResult};
 use reth_evm::ConfigureEvm;
@@ -321,6 +324,34 @@ where
     payload_build_finished: Receiver<()>,
     /// Task runtime for spawning blocking work on named, reusable threads.
     runtime: reth_tasks::Runtime,
+    /// The known part of the chain to the sync target head, see
+    /// [`Self::extend_sync_target_chain`].
+    sync_target_chain: SyncTargetChain,
+    /// The buffered-block connection in progress, see [`Self::try_connect_buffered_blocks`].
+    connecting: Option<ConnectingBlocks>,
+}
+
+/// The known part of the chain that leads to a sync target head.
+///
+/// Holds the head and every ancestor of it found so far, down to `lowest`. A block's parent never
+/// changes, so the set only grows while the head stays the same, and each block is looked up once.
+#[derive(Debug, Default)]
+struct SyncTargetChain {
+    /// The sync target head the chain leads to.
+    head: Option<B256>,
+    /// The head and its ancestors found so far.
+    blocks: B256Set,
+    /// The lowest block found so far, whose parent is looked up next.
+    lowest: B256,
+}
+
+/// A buffered-block connection in progress.
+#[derive(Debug)]
+struct ConnectingBlocks {
+    /// Blocks whose buffered children are still to be connected.
+    parents: Vec<BlockNumHash>,
+    /// The sync target head the connected blocks are made canonical towards.
+    sync_target_head: Option<B256>,
 }
 
 impl<N, P: Debug, T: PayloadTypes + Debug, V: Debug, C> std::fmt::Debug
@@ -415,6 +446,8 @@ where
             payload_builds,
             payload_build_finished,
             runtime,
+            sync_target_chain: SyncTargetChain::default(),
+            connecting: None,
         }
     }
 
@@ -692,6 +725,16 @@ where
         }
 
         trace!(target: "engine::tree", block_count = %blocks.len(), "received downloaded blocks");
+        if let Some(sync_target) = self.state.forkchoice_state_tracker.sync_target_state() {
+            let downloaded = blocks
+                .iter()
+                .map(|block| {
+                    let block = block.block_with_parent();
+                    (block.block.hash, block.parent)
+                })
+                .collect();
+            self.extend_sync_target_chain(sync_target.head_block_hash, &downloaded);
+        }
         let batch = self.config.max_execute_block_batch_size().min(blocks.len());
         for block in blocks.drain(..batch) {
             if let Some(event) = self.on_downloaded_block(block)? {
@@ -1173,6 +1216,16 @@ where
             return Ok(result);
         }
 
+        // The head may be buffered on top of a block that is already known.
+        if self.connect_to_forkchoice_head(state)? {
+            if let Some(result) = self.handle_canonical_head(state, &attrs)? {
+                return Ok(result);
+            }
+            return Ok(TreeOutcome::new(OnForkChoiceUpdated::valid(PayloadStatus::from_status(
+                PayloadStatusEnum::Syncing,
+            ))));
+        }
+
         // Fallback that ensures to catch up to the network's state.
         self.handle_missing_block(state)
     }
@@ -1405,6 +1458,48 @@ where
             DownloadRequest::single_block(target)
                 .with_access_lists(self.should_download_access_lists()),
         )))
+    }
+
+    /// Connects the buffered blocks leading to the forkchoice head if they descend from a block
+    /// that is already known, and returns whether it did.
+    ///
+    /// Such blocks wait for the known block's state rather than for a download. The known block is
+    /// an ancestor of the forkchoice head, so if it is executed but not canonical and extends the
+    /// canonical head, it is made canonical first. The connected blocks are made canonical towards
+    /// the forkchoice head being processed, which is not yet the tracked sync target.
+    fn connect_to_forkchoice_head(&mut self, state: ForkchoiceState) -> ProviderResult<bool> {
+        let head = state.head_block_hash;
+        let Some(known) =
+            self.state.buffer.lowest_ancestor(&head).map(|block| block.parent_num_hash())
+        else {
+            return Ok(false)
+        };
+        if !self.has_block_by_hash(known.hash)? {
+            return Ok(false)
+        }
+
+        let extends_canonical_head =
+            self.state.tree_state.executed_block_by_hash(known.hash).is_some_and(|block| {
+                block.recovered_block().parent_hash() ==
+                    self.state.tree_state.canonical_block_hash()
+            });
+        debug!(target: "engine::tree", ?known, extends_canonical_head, "connecting buffered blocks to known ancestor of the forkchoice head");
+        let connected = self.connect_buffered_blocks(Some(head), |this| {
+            if extends_canonical_head {
+                this.make_canonical(known.hash)?;
+            } else {
+                this.queue_buffered_children(known);
+            }
+            Ok(())
+        });
+        match connected {
+            Ok(()) => Ok(true),
+            Err(InsertBlockFatalError::Provider(err)) => Err(err),
+            Err(err) => {
+                warn!(target: "engine::tree", %err, "failed to connect buffered blocks to known block");
+                Ok(true)
+            }
+        }
     }
 
     /// Helper method to remove blocks and set the persistence state. This ensures we keep track of
@@ -1963,8 +2058,11 @@ where
                 );
 
                 self.emit_event(EngineApiEvent::Download(
-                    DownloadRequest::block_range(lowest_buffered.parent_hash(), distance)
-                        .with_access_lists(self.should_download_access_lists()),
+                    DownloadRequest::block_range(
+                        lowest_buffered.parent_hash(),
+                        distance.min(MAX_BLOCK_RANGE_DOWNLOAD),
+                    )
+                    .with_access_lists(self.should_download_access_lists()),
                 ));
                 return Ok(());
             }
@@ -2668,49 +2766,161 @@ where
     }
 
     /// Attempts to connect any buffered blocks that are connected to the given parent hash.
+    ///
+    /// A connected block that extends the canonical head on the way to the sync target head is
+    /// made canonical straight away, see [`Self::is_next_canonical_block`].
     #[instrument(level = "debug", target = "engine::tree", skip(self))]
     fn try_connect_buffered_blocks(
         &mut self,
         parent: BlockNumHash,
     ) -> Result<(), InsertBlockFatalError> {
-        let blocks = self.state.buffer.remove_block_with_children(&parent.hash);
+        let sync_target_head = self
+            .state
+            .forkchoice_state_tracker
+            .sync_target_state()
+            .map(|state| state.head_block_hash);
+        self.connect_buffered_blocks(sync_target_head, |this| {
+            this.queue_buffered_children(parent);
+            Ok(())
+        })
+    }
 
-        if blocks.is_empty() {
-            // nothing to append
-            return Ok(())
+    /// Queues the buffered children of `parent` for the connection in progress.
+    fn queue_buffered_children(&mut self, parent: BlockNumHash) {
+        if let Some(connecting) = self.connecting.as_mut() {
+            connecting.parents.push(parent);
+        }
+    }
+
+    /// Runs `start` within a buffered-block connection and then connects every queued parent's
+    /// buffered children, making them canonical towards `sync_target_head`.
+    ///
+    /// Making a block canonical queues its buffered children through
+    /// [`Self::on_canonical_chain_update`]. While a connection is in progress, a nested call only
+    /// runs `start`, so its parents are connected by the outer loop: the call depth stays the same
+    /// however long the buffered chain is.
+    fn connect_buffered_blocks(
+        &mut self,
+        sync_target_head: Option<B256>,
+        start: impl FnOnce(&mut Self) -> Result<(), InsertBlockFatalError>,
+    ) -> Result<(), InsertBlockFatalError> {
+        if self.connecting.is_some() {
+            return start(self)
         }
 
-        let now = Instant::now();
-        let block_count = blocks.len();
-        for child in blocks {
-            let child_num_hash = child.num_hash();
-            match self.insert_block(child) {
-                Ok(res) => {
-                    debug!(target: "engine::tree", child =?child_num_hash, ?res, "connected buffered block");
-                    if self.is_any_sync_target(child_num_hash.hash) &&
-                        matches!(res, InsertPayloadOk::Inserted(BlockStatus::Valid))
-                    {
-                        debug!(target: "engine::tree", child =?child_num_hash, "connected sync target block");
-                        // we just inserted a block that we know is part of the canonical chain, so
-                        // we can make it canonical
-                        self.make_canonical(child_num_hash.hash)?;
-                    }
-                }
-                Err(err) => {
-                    if let InsertPayloadError::Block(err) = err {
-                        debug!(target: "engine::tree", ?err, "failed to connect buffered block to tree");
-                        if let Err(InsertBlockProcessingError::Fatal(fatal)) =
-                            self.on_insert_block_error(err)
+        self.connecting = Some(ConnectingBlocks { parents: Vec::new(), sync_target_head });
+        let result = start(self).and_then(|()| self.connect_queued_parents());
+        self.connecting = None;
+        result
+    }
+
+    /// Connects the buffered children of every parent queued in the connection in progress.
+    fn connect_queued_parents(&mut self) -> Result<(), InsertBlockFatalError> {
+        while let Some((parent, sync_target_head)) =
+            self.connecting.as_mut().and_then(|connecting| {
+                connecting.parents.pop().map(|parent| (parent, connecting.sync_target_head))
+            })
+        {
+            let blocks = self.state.buffer.remove_block_with_children(&parent.hash);
+
+            if blocks.is_empty() {
+                // nothing to append
+                continue
+            }
+
+            if let Some(head) = sync_target_head {
+                let connecting =
+                    blocks.iter().map(|block| (block.hash(), block.parent_hash())).collect();
+                self.extend_sync_target_chain(head, &connecting);
+            }
+
+            let now = Instant::now();
+            let block_count = blocks.len();
+            for child in blocks {
+                let child_num_hash = child.num_hash();
+                match self.insert_block(child) {
+                    Ok(res) => {
+                        debug!(target: "engine::tree", child =?child_num_hash, ?res, "connected buffered block");
+                        if self.is_any_sync_target(child_num_hash.hash) &&
+                            matches!(res, InsertPayloadOk::Inserted(BlockStatus::Valid))
                         {
-                            warn!(target: "engine::tree", %fatal, "fatal error occurred while connecting buffered blocks");
+                            debug!(target: "engine::tree", child =?child_num_hash, "connected sync target block");
+                            // we just inserted a block that we know is part of the canonical chain,
+                            // so we can make it canonical
+                            self.make_canonical(child_num_hash.hash)?;
+                        } else if matches!(res, InsertPayloadOk::Inserted(BlockStatus::Valid)) &&
+                            sync_target_head.is_some_and(|head| {
+                                self.is_next_canonical_block(child_num_hash.hash, head)
+                            })
+                        {
+                            debug!(target: "engine::tree", child =?child_num_hash, "connected block on the way to the sync target");
+                            self.make_canonical(child_num_hash.hash)?;
+                        }
+                    }
+                    Err(err) => {
+                        if let InsertPayloadError::Block(err) = err {
+                            debug!(target: "engine::tree", ?err, "failed to connect buffered block to tree");
+                            if let Err(InsertBlockProcessingError::Fatal(fatal)) =
+                                self.on_insert_block_error(err)
+                            {
+                                warn!(target: "engine::tree", %fatal, "fatal error occurred while connecting buffered blocks");
+                            }
                         }
                     }
                 }
             }
+
+            debug!(target: "engine::tree", elapsed = ?now.elapsed(), %block_count, "connected buffered blocks");
+        }
+        Ok(())
+    }
+
+    /// Extends the known chain to the sync target `head` with the ancestors of its lowest known
+    /// block found in the buffer or in `pending`, which maps the hash of each block on its way into
+    /// the tree to its parent hash.
+    ///
+    /// The known chain is kept between calls and restarts from `head` only when the head changes,
+    /// so every block is looked up once while the head stays the same.
+    fn extend_sync_target_chain(&mut self, head: B256, pending: &B256Map<B256>) {
+        let chain = &mut self.sync_target_chain;
+        if chain.head != Some(head) {
+            *chain = SyncTargetChain {
+                head: Some(head),
+                blocks: B256Set::from_iter([head]),
+                lowest: head,
+            };
         }
 
-        debug!(target: "engine::tree", elapsed = ?now.elapsed(), %block_count, "connected buffered blocks");
-        Ok(())
+        loop {
+            let parent = match self.state.buffer.block(&chain.lowest) {
+                Some(block) => block.parent_hash(),
+                None => match pending.get(&chain.lowest) {
+                    Some(parent) => *parent,
+                    None => break,
+                },
+            };
+            if !chain.blocks.insert(parent) {
+                break
+            }
+            chain.lowest = parent;
+        }
+    }
+
+    /// Returns whether an executed block extends the canonical head and lies on the known chain to
+    /// the sync target `head`, see [`Self::extend_sync_target_chain`].
+    ///
+    /// Such a block is made canonical as soon as it is executed instead of when the sync target
+    /// head is. It is an ancestor of the head the consensus layer chose, so the canonical chain
+    /// only moves where the sync target head would move it, one block earlier. The child of such
+    /// a block then always executes on the canonical head, which is the only state some nodes'
+    /// state providers can serve, see [`ProviderError::ParentStateNotReady`].
+    fn is_next_canonical_block(&self, block: B256, head: B256) -> bool {
+        self.sync_target_chain.head == Some(head) &&
+            self.sync_target_chain.blocks.contains(&block) &&
+            self.state.tree_state.executed_block_by_hash(block).is_some_and(|executed| {
+                executed.recovered_block().parent_hash() ==
+                    self.state.tree_state.canonical_block_hash()
+            })
     }
 
     /// Pre-validates the block and inserts it into the buffer.
@@ -2766,12 +2976,18 @@ where
     ///
     /// If this is invoked after a new block has been downloaded, the downloaded block could be
     /// the (missing) target block.
+    ///
+    /// Always `None` when backfill is disabled, see [`TreeConfig::disable_backfill`].
     fn backfill_sync_target(
         &self,
         canonical_tip_num: u64,
         target_block_number: u64,
         downloaded_block: Option<BlockNumHash>,
     ) -> Option<B256> {
+        if self.config.disable_backfill() {
+            return None
+        }
+
         let state = self.state.forkchoice_state_tracker.sync_target_state()?;
         let target_hash = self.backfill_target_hash(state);
 
@@ -2873,6 +3089,9 @@ where
     /// Invoked when we the canonical chain has been updated.
     ///
     /// This is invoked on a valid forkchoice update, or if we can make the target block canonical.
+    ///
+    /// Afterwards, buffered children of the new tip are connected: a block whose parent state was
+    /// not ready waits in the buffer until its parent becomes canonical.
     fn on_canonical_chain_update(&mut self, chain_update: NewCanonicalChain<N>) {
         trace!(target: "engine::tree", new_blocks = %chain_update.new_block_count(), reorged_blocks =  %chain_update.reorged_block_count(), "applying new chain update");
         let start = Instant::now();
@@ -2906,11 +3125,17 @@ where
         // sends an event to all active listeners about the new canonical chain
         self.canonical_in_memory_state.notify_canon_state(notification);
 
+        let tip_num_hash = tip.num_hash();
+
         // emit event
         self.emit_event(ConsensusEngineEvent::CanonicalChainCommitted(
             Box::new(tip),
             start.elapsed(),
         ));
+
+        if let Err(err) = self.try_connect_buffered_blocks(tip_num_hash) {
+            warn!(target: "engine::tree", %err, "failed to connect buffered blocks to the new canonical head");
+        }
     }
 
     /// This updates metrics based on the given reorg length and first reorged block number.
@@ -2976,11 +3201,16 @@ where
         //  * the missing parent block num >= canonical tip num, but the number of missing blocks is
         //    less than the backfill threshold
         //    * this case represents a potentially long range of blocks to download and execute
+        //
+        // Peers answer at most `MAX_BLOCK_RANGE_DOWNLOAD` headers per request, so a longer range is
+        // downloaded in pieces: the lowest block of each piece is disconnected in turn and
+        // requests the next piece below it.
         let request = if let Some(distance) =
             self.distance_from_local_tip(head.number, missing_parent.number)
         {
-            trace!(target: "engine::tree", %distance, missing=?missing_parent, "downloading missing parent block range");
-            DownloadRequest::block_range(missing_parent.hash, distance)
+            let count = distance.min(MAX_BLOCK_RANGE_DOWNLOAD);
+            trace!(target: "engine::tree", %distance, %count, missing=?missing_parent, "downloading missing parent block range");
+            DownloadRequest::block_range(missing_parent.hash, count)
         } else {
             trace!(target: "engine::tree", missing=?missing_parent, "downloading missing parent block");
             // This happens when the missing parent is on an outdated
@@ -2996,6 +3226,8 @@ where
     /// If the block matches the sync target head, returns [`TreeAction::MakeCanonical`].
     /// If it matches a non-head sync target (safe or finalized), makes it canonical inline
     /// and triggers a download for the remaining blocks towards the actual head.
+    /// If it extends the canonical head on the way to the sync target head, makes it canonical
+    /// inline, see [`Self::is_next_canonical_block`].
     /// Otherwise, tries to connect buffered blocks.
     fn on_valid_downloaded_block(
         &mut self,
@@ -3034,6 +3266,16 @@ where
 
             return Ok(None)
         }
+
+        if let Some(sync_target) = self.state.forkchoice_state_tracker.sync_target_state() &&
+            self.is_next_canonical_block(block_num_hash.hash, sync_target.head_block_hash)
+        {
+            trace!(target: "engine::tree", "appended downloaded block on the way to the sync target");
+            // also connects the buffered children of the block
+            self.make_canonical(block_num_hash.hash)?;
+            return Ok(None)
+        }
+
         trace!(target: "engine::tree", "appended downloaded block");
         self.try_connect_buffered_blocks(block_num_hash)?;
         Ok(None)
@@ -3281,12 +3523,27 @@ where
     ///
     /// If this is a validation error this will mark the block as invalid.
     ///
+    /// If the state of the block's parent is not ready yet, the block is buffered and reported as
+    /// syncing, like a block whose parent is missing. It is executed again once its parent becomes
+    /// canonical, see [`Self::on_canonical_chain_update`].
+    ///
     /// Returns the proper payload status response if the block is invalid.
     fn on_insert_block_error(
         &mut self,
         error: InsertBlockError<N::Block>,
     ) -> Result<PayloadStatus, InsertBlockProcessingError> {
         let (block, error) = error.split();
+
+        if error.is_parent_state_not_ready() {
+            debug!(
+                target: "engine::tree",
+                block=?block.num_hash(),
+                %error,
+                "Parent state not ready, buffering block",
+            );
+            self.state.buffer.insert_block(block.into());
+            return Ok(PayloadStatus::from_status(PayloadStatusEnum::Syncing))
+        }
 
         let validation_err = error.ensure_validation_error()?;
 

@@ -32,6 +32,12 @@ pub const DEFAULT_BACKFILL_RUN_THRESHOLD: u64 = EPOCH_SLOTS;
 /// The range downloader requires a complete response and cannot yet split larger requests.
 pub const MAX_BACKFILL_RUN_THRESHOLD: u64 = 1024;
 
+/// Largest number of blocks requested in one block range download, matching the peer header
+/// response limit of 1024.
+///
+/// A longer missing range is downloaded in several requests of at most this many blocks.
+pub const MAX_BLOCK_RANGE_DOWNLOAD: u64 = 1024;
+
 /// The size of proof targets chunk to spawn in one multiproof calculation.
 pub const DEFAULT_MULTIPROOF_TASK_CHUNK_SIZE: usize = 5;
 
@@ -135,6 +141,9 @@ pub struct TreeConfig {
     /// Largest gap between the local head and a new canonical block that is closed by downloading
     /// the missing blocks. Larger gaps trigger a pipeline (backfill) run instead.
     backfill_run_threshold: u64,
+    /// Whether to close every gap by downloading the missing blocks, never by a pipeline
+    /// (backfill) run.
+    disable_backfill: bool,
     /// Number of invalid headers to keep in cache.
     max_invalid_header_cache_length: u32,
     /// Number of cache hits before an invalid header entry is evicted and reprocessed.
@@ -258,6 +267,7 @@ impl Default for TreeConfig {
             persistence_backpressure_threshold: DEFAULT_PERSISTENCE_THRESHOLD * 2,
             block_buffer_limit: DEFAULT_BLOCK_BUFFER_LIMIT,
             backfill_run_threshold: DEFAULT_BACKFILL_RUN_THRESHOLD,
+            disable_backfill: false,
             max_invalid_header_cache_length: DEFAULT_MAX_INVALID_HEADER_CACHE_LENGTH,
             invalid_header_hit_eviction_threshold: DEFAULT_INVALID_HEADER_HIT_EVICTION_THRESHOLD,
             max_execute_block_batch_size: DEFAULT_MAX_EXECUTE_BLOCK_BATCH_SIZE,
@@ -344,6 +354,7 @@ impl TreeConfig {
             persistence_backpressure_threshold,
             block_buffer_limit,
             backfill_run_threshold: clamp_backfill_run_threshold(backfill_run_threshold),
+            disable_backfill: false,
             max_invalid_header_cache_length,
             invalid_header_hit_eviction_threshold,
             max_execute_block_batch_size,
@@ -405,6 +416,12 @@ impl TreeConfig {
     /// Return the backfill run threshold.
     pub const fn backfill_run_threshold(&self) -> u64 {
         self.backfill_run_threshold
+    }
+
+    /// Returns whether pipeline (backfill) runs are disabled, so that every gap is closed by
+    /// downloading the missing blocks.
+    pub const fn disable_backfill(&self) -> bool {
+        self.disable_backfill
     }
 
     /// Return the maximum invalid cache header length.
@@ -577,6 +594,16 @@ impl TreeConfig {
         if buffer_limit > self.block_buffer_limit {
             self.block_buffer_limit = buffer_limit;
         }
+        self
+    }
+
+    /// Setter for whether pipeline (backfill) runs are disabled.
+    ///
+    /// With backfill disabled, the engine closes every gap by downloading the missing blocks in
+    /// ranges of at most [`MAX_BLOCK_RANGE_DOWNLOAD`] blocks. The block buffer must then be
+    /// large enough to hold the whole gap, see [`Self::with_block_buffer_limit`].
+    pub const fn with_disable_backfill(mut self, disable_backfill: bool) -> Self {
+        self.disable_backfill = disable_backfill;
         self
     }
 

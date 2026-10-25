@@ -206,6 +206,12 @@ pub enum ProviderError {
         /// Attempt that owns the unverified state.
         attempt: u64,
     },
+    /// The state a block executes on, the post-state of its parent, is not available yet.
+    ///
+    /// The block is neither invalid nor unprocessable. The engine keeps it and executes it again
+    /// once its parent becomes canonical.
+    #[error("the state of parent block {_0} is not ready yet")]
+    ParentStateNotReady(BlockHash),
     /// Any other error type wrapped into a cloneable [`AnyError`].
     #[error(transparent)]
     Other(#[from] AnyError),

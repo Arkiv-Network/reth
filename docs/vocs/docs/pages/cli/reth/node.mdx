@@ -1059,6 +1059,16 @@ Engine:
           [env: RETH_ENGINE_BACKFILL_THRESHOLD=]
           [default: 32]
 
+      --engine.disable-backfill
+          Never run the pipeline (backfill) to close a gap; download the missing blocks instead, however large the gap is.
+
+          Downloads are requested in ranges of at most 1024 blocks, and the downloaded blocks wait in the block buffer until the gap is closed, so `--engine.block-buffer-limit` should be large enough to hold the largest expected gap.
+
+      --engine.block-buffer-limit <BLOCK_BUFFER_LIMIT>
+          Configure how many blocks that cannot be executed yet, for example because their parent is still missing, are kept in the block buffer.
+
+          If omitted, the default limit applies, raised to twice `--engine.backfill-threshold` when that is larger.
+
       --engine.invalid-header-cache-hit-eviction-threshold <INVALID_HEADER_HIT_EVICTION_THRESHOLD>
           Configure how many cache hits an invalid header can accumulate before it is evicted and reprocessed.
 

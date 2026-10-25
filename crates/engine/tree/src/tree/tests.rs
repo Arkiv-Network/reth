@@ -3529,3 +3529,393 @@ async fn test_fcu_back_to_reorged_out_head_with_pending_disk_reorg() {
 async fn test_fcu_back_to_reorged_out_head_above_shorter_branch_with_pending_disk_reorg() {
     assert_fcu_back_to_reorged_out_head_with_pending_disk_reorg(1).await;
 }
+
+/// Engine validator whose execution can only read the state of the canonical head, like a node
+/// that saves a block only once it becomes canonical.
+///
+/// It executes a block by returning its prepared [`ExecutedBlock`], and reports
+/// [`ProviderError::ParentStateNotReady`] for a block whose parent is not the canonical head.
+struct CanonicalHeadValidator {
+    blocks: B256Map<ExecutedBlock>,
+}
+
+impl CanonicalHeadValidator {
+    fn new(blocks: &[ExecutedBlock]) -> Self {
+        Self {
+            blocks: blocks
+                .iter()
+                .map(|block| (block.recovered_block().hash(), block.clone()))
+                .collect(),
+        }
+    }
+
+    fn execute(
+        &self,
+        block: SealedBlock<Block>,
+        ctx: &TreeCtx<'_, EthPrimitives>,
+    ) -> ValidationOutcome<EthPrimitives> {
+        let parent = block.parent_hash();
+        if parent != ctx.state().tree_state.canonical_block_hash() {
+            return Err(InsertBlockError::new(
+                block,
+                InsertBlockErrorKind::Provider(ProviderError::ParentStateNotReady(parent)),
+            )
+            .into())
+        }
+        Ok(ValidationOutput::new(self.blocks[&block.hash()].clone(), None))
+    }
+}
+
+impl WaitForCaches for CanonicalHeadValidator {
+    fn wait_for_caches(&self) -> CacheWaitDurations {
+        CacheWaitDurations::default()
+    }
+}
+
+impl EngineValidator<EthEngineTypes> for CanonicalHeadValidator {
+    fn validate_payload_attributes_against_header(
+        &self,
+        _attr: &EthPayloadAttributes,
+        _header: &alloy_consensus::Header,
+    ) -> Result<(), reth_payload_primitives::InvalidPayloadAttributesError> {
+        Ok(())
+    }
+
+    fn convert_payload_to_block(
+        &self,
+        payload: ExecutionData,
+    ) -> Result<SealedBlock<Block>, NewPayloadError> {
+        self.blocks
+            .get(&payload.block_hash())
+            .map(|block| block.recovered_block().clone_sealed_block())
+            .ok_or_else(|| NewPayloadError::Other("unknown payload".into()))
+    }
+
+    fn validate_payload(
+        &mut self,
+        payload: ExecutionData,
+        ctx: TreeCtx<'_, EthPrimitives>,
+    ) -> ValidationOutcome<EthPrimitives> {
+        let block = self.convert_payload_to_block(payload)?;
+        self.execute(block, &ctx)
+    }
+
+    fn validate_block(
+        &mut self,
+        block: SealedBlockWithAccessList<Block>,
+        ctx: TreeCtx<'_, EthPrimitives>,
+    ) -> ValidationOutcome<EthPrimitives> {
+        self.execute(block.split().0, &ctx)
+    }
+
+    fn on_inserted_executed_block(
+        &self,
+        _block: reth_payload_primitives::BuiltPayloadExecutedBlock<EthPrimitives>,
+    ) -> ProviderResult<ExecutedBlock> {
+        unimplemented!("not used by these tests")
+    }
+
+    fn payload_builder_resources(
+        &self,
+        _parent_hash: B256,
+        _parent_header: &alloy_consensus::Header,
+        _timestamp: u64,
+        _state: &mut EngineApiTreeState<EthPrimitives>,
+    ) -> reth_payload_builder::PayloadBuilderResources {
+        unimplemented!("not used by these tests")
+    }
+}
+
+/// Engine tree that executes with a [`CanonicalHeadValidator`].
+struct CanonicalHeadHarness {
+    tree: EngineApiTreeHandler<
+        EthPrimitives,
+        MockEthProvider,
+        EthEngineTypes,
+        CanonicalHeadValidator,
+        MockEvmConfig,
+    >,
+    from_tree_rx: UnboundedReceiver<EngineApiEvent>,
+    // keeps the persistence channel open
+    _action_rx: Receiver<PersistenceAction>,
+}
+
+impl CanonicalHeadHarness {
+    /// Creates a tree whose canonical chain is `chain[..=head]` and that can execute every block of
+    /// `chain`.
+    fn new(chain: &[ExecutedBlock], head: usize, config: TreeConfig) -> Self {
+        let harness =
+            TestHarness::with_config(MAINNET.clone(), config).with_blocks(chain[..=head].to_vec());
+        let TestHarness { tree, from_tree_rx, action_rx, .. } = harness;
+        let EngineApiTreeHandler {
+            provider,
+            consensus,
+            outgoing,
+            mut state,
+            canonical_in_memory_state,
+            persistence,
+            persistence_state,
+            payload_builder,
+            config,
+            engine_kind,
+            evm_config,
+            runtime,
+            ..
+        } = tree;
+        state.buffer = BlockBuffer::new(config.block_buffer_limit());
+        let tree = EngineApiTreeHandler::new(
+            provider,
+            consensus,
+            CanonicalHeadValidator::new(chain),
+            outgoing,
+            state,
+            canonical_in_memory_state,
+            persistence,
+            persistence_state,
+            payload_builder,
+            config,
+            engine_kind,
+            evm_config,
+            runtime,
+        );
+        Self { tree, from_tree_rx, _action_rx: action_rx }
+    }
+
+    fn new_payload(&mut self, block: &ExecutedBlock) -> PayloadStatus {
+        let block = block.recovered_block();
+        let payload = ExecutionData {
+            payload: ExecutionPayloadV1::from_block_unchecked(block.hash(), &block.clone_block())
+                .into(),
+            sidecar: ExecutionPayloadSidecar::none(),
+        };
+        let (tx, mut rx) = oneshot::channel();
+        let _ = self
+            .tree
+            .on_engine_message(FromEngine::Request(
+                BeaconEngineMessage::NewPayload { payload, tx }.into(),
+            ))
+            .unwrap();
+        rx.try_recv().unwrap().unwrap()
+    }
+
+    fn forkchoice_updated(&mut self, head: B256) -> ForkchoiceStatus {
+        let state = ForkchoiceState {
+            head_block_hash: head,
+            safe_block_hash: B256::ZERO,
+            finalized_block_hash: B256::ZERO,
+        };
+        let (tx, mut rx) = oneshot::channel();
+        let _ = self
+            .tree
+            .on_engine_message(FromEngine::Request(
+                BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs: None, tx }.into(),
+            ))
+            .unwrap();
+        rx.try_recv().unwrap().unwrap().forkchoice_status()
+    }
+
+    fn downloaded(&mut self, blocks: &[ExecutedBlock]) {
+        let blocks = downloaded_blocks(
+            blocks.iter().map(|block| block.recovered_block().clone_sealed_block()).collect(),
+        );
+        let _ = self.tree.on_engine_message(FromEngine::DownloadedBlocks(blocks)).unwrap();
+        // the tree sends batches it does not execute at once back to itself
+        while let Ok(msg) = self.tree.incoming.try_recv() {
+            let _ = self.tree.on_engine_message(msg).unwrap();
+        }
+    }
+
+    /// Drains the emitted events, returning the download requests and the hashes of the blocks
+    /// that became the canonical head, in order.
+    fn drain_events(&mut self) -> (Vec<DownloadRequest>, Vec<B256>) {
+        let mut downloads = Vec::new();
+        let mut heads = Vec::new();
+        while let Ok(event) = self.from_tree_rx.try_recv() {
+            match event {
+                EngineApiEvent::Download(request) => downloads.push(request),
+                EngineApiEvent::BeaconConsensus(ConsensusEngineEvent::CanonicalChainCommitted(
+                    tip,
+                    _,
+                )) => heads.push(tip.hash()),
+                _ => {}
+            }
+        }
+        (downloads, heads)
+    }
+
+    fn canonical_head(&self) -> B256 {
+        self.tree.state.tree_state.canonical_block_hash()
+    }
+}
+
+/// A payload whose parent state is not ready is buffered and answered `SYNCING`, and executes
+/// once its parent becomes canonical.
+#[test]
+fn test_parent_state_not_ready_payload_is_buffered_until_parent_is_canonical() {
+    reth_tracing::init_test_tracing();
+
+    let chain: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..3).collect();
+    let hashes: Vec<_> = chain.iter().map(|block| block.recovered_block().hash()).collect();
+    let mut harness = CanonicalHeadHarness::new(&chain, 0, TreeConfig::default());
+
+    // block 1 extends the canonical head and executes
+    assert!(harness.new_payload(&chain[1]).is_valid());
+
+    // block 2 arrives before block 1 is canonical: its parent's state is not ready
+    let status = harness.new_payload(&chain[2]);
+    assert!(status.is_syncing());
+    assert!(harness.tree.state.buffer.block(&hashes[2]).is_some());
+    assert!(!harness.tree.state.tree_state.contains_hash(&hashes[2]));
+    assert!(!harness.tree.state.has_invalid_header(&hashes[2]));
+
+    // making block 1 canonical executes the buffered block 2
+    assert_eq!(harness.forkchoice_updated(hashes[1]), ForkchoiceStatus::Valid);
+    assert!(harness.tree.state.buffer.block(&hashes[2]).is_none());
+    assert!(harness.tree.state.tree_state.contains_hash(&hashes[2]));
+    assert_eq!(harness.canonical_head(), hashes[1]);
+
+    assert_eq!(harness.forkchoice_updated(hashes[2]), ForkchoiceStatus::Valid);
+    assert_eq!(harness.canonical_head(), hashes[2]);
+}
+
+/// Downloaded blocks on the way to the sync target become canonical one block at a time, so
+/// each one executes on the canonical head.
+#[test]
+fn test_downloaded_range_becomes_canonical_block_by_block() {
+    reth_tracing::init_test_tracing();
+
+    let chain: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..7).collect();
+    let hashes: Vec<_> = chain.iter().map(|block| block.recovered_block().hash()).collect();
+    let target = hashes[6];
+    let mut harness = CanonicalHeadHarness::new(&chain, 0, TreeConfig::default());
+
+    // the forkchoice head is missing and is downloaded first
+    assert_eq!(harness.forkchoice_updated(target), ForkchoiceStatus::Syncing);
+    let (downloads, _) = harness.drain_events();
+    assert_matches!(
+        downloads.as_slice(),
+        [DownloadRequest::BlockSet { hashes, .. }] if hashes.contains(&target)
+    );
+
+    // the downloaded head is disconnected and requests the five blocks below it
+    harness.downloaded(&chain[6..]);
+    let (downloads, _) = harness.drain_events();
+    assert_matches!(
+        downloads.as_slice(),
+        [DownloadRequest::BlockRange { hash, count: 5, .. }] if *hash == hashes[5]
+    );
+
+    // each downloaded block becomes canonical before the next one executes
+    harness.downloaded(&chain[1..6]);
+    let (downloads, heads) = harness.drain_events();
+    assert!(downloads.is_empty());
+    assert_eq!(heads, hashes[1..].to_vec());
+    assert_eq!(harness.canonical_head(), target);
+    assert!(harness.tree.state.buffer.block(&target).is_none());
+}
+
+/// Downloads a gap of `gap` blocks below a forkchoice head with backfill disabled, serving each
+/// range request as it is made, and returns the requested range sizes once the head is canonical,
+/// together with the harness.
+fn download_gap_without_backfill(gap: usize) -> (Vec<u64>, CanonicalHeadHarness) {
+    let chain: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..gap as u64 + 2).collect();
+    let hashes: Vec<_> = chain.iter().map(|block| block.recovered_block().hash()).collect();
+    let target = hashes[gap + 1];
+    let config = TreeConfig::default()
+        .with_has_enough_parallelism(true)
+        .with_disable_backfill(true)
+        .with_block_buffer_limit(gap as u32 + 64);
+    let mut harness = CanonicalHeadHarness::new(&chain, 0, config);
+
+    assert_eq!(harness.forkchoice_updated(target), ForkchoiceStatus::Syncing);
+    let (downloads, _) = harness.drain_events();
+    assert_matches!(downloads.as_slice(), [DownloadRequest::BlockSet { .. }]);
+    harness.downloaded(&chain[gap + 1..]);
+
+    // serve every range request until no more are made
+    let mut ranges = Vec::new();
+    loop {
+        let (downloads, _) = harness.drain_events();
+        let mut requested = downloads
+            .into_iter()
+            .filter_map(|request| match request {
+                DownloadRequest::BlockRange { hash, count, .. } => Some((hash, count)),
+                DownloadRequest::BlockSet { .. } => None,
+            })
+            .filter(|request| !ranges.contains(request))
+            .collect::<Vec<_>>();
+        requested.dedup();
+        let Some(&(hash, count)) = requested.first() else { break };
+        assert_eq!(requested.len(), 1, "one range request at a time: {requested:?}");
+        ranges.push((hash, count));
+
+        let top = hashes.iter().position(|h| *h == hash).unwrap();
+        harness.downloaded(&chain[top + 1 - count as usize..=top]);
+    }
+
+    assert_eq!(harness.canonical_head(), target);
+    assert!(harness.tree.state.buffer.blocks.is_empty());
+    (ranges.into_iter().map(|(_, count)| count).collect(), harness)
+}
+
+/// With backfill disabled, a gap of 3,000 blocks is downloaded in three range requests of at
+/// most 1,024 blocks and connects to the canonical chain.
+#[test]
+fn test_disabled_backfill_downloads_large_gap_in_pieces() {
+    reth_tracing::init_test_tracing();
+
+    assert_eq!(download_gap_without_backfill(3_000).0, vec![1024, 1024, 952]);
+}
+
+/// A gap of 20,000 blocks connects on a thread with a 1 MiB stack: connecting a long buffered
+/// chain does not nest a call per block, and looking up the chain to the sync target does not
+/// walk the whole buffer per block.
+#[test]
+fn test_disabled_backfill_connects_very_large_gap_on_small_stack() {
+    reth_tracing::init_test_tracing();
+
+    let (counts, harness) = std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(|| download_gap_without_backfill(20_000))
+        .unwrap()
+        .join()
+        .unwrap();
+
+    // The canonical in-memory state links each block to its parent, and without persistence it
+    // holds all 20,000 blocks, so dropping it recurses once per block and needs a large stack.
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || drop(harness))
+        .unwrap()
+        .join()
+        .unwrap();
+
+    assert_eq!(counts.len(), 20);
+    assert!(counts.iter().all(|count| *count <= 1024));
+    assert_eq!(counts.iter().sum::<u64>(), 20_000);
+}
+
+/// Buffered blocks waiting on an executed, non-canonical parent connect and become canonical
+/// within the forkchoice update to their head that finds them.
+#[test]
+fn test_forkchoice_update_connects_blocks_waiting_on_known_parent() {
+    reth_tracing::init_test_tracing();
+
+    let chain: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..5).collect();
+    let hashes: Vec<_> = chain.iter().map(|block| block.recovered_block().hash()).collect();
+    let mut harness = CanonicalHeadHarness::new(&chain, 0, TreeConfig::default());
+
+    // block 1 executes but is not canonical, block 2 waits for its state, and blocks 3 and 4
+    // wait for block 2
+    assert!(harness.new_payload(&chain[1]).is_valid());
+    for block in &chain[2..] {
+        assert!(harness.new_payload(block).is_syncing());
+    }
+
+    assert_eq!(harness.forkchoice_updated(hashes[4]), ForkchoiceStatus::Valid);
+    assert_eq!(harness.canonical_head(), hashes[4]);
+    assert!(harness.tree.state.buffer.blocks.is_empty());
+    let (downloads, heads) = harness.drain_events();
+    assert!(downloads.is_empty());
+    assert_eq!(heads, hashes[1..].to_vec());
+}
