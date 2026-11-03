@@ -1,9 +1,39 @@
 pub use alloy_eips::eip1559::calculate_block_gas_limit;
 use alloy_eips::eip1559::ETHEREUM_BLOCK_GAS_LIMIT_30M;
-use alloy_primitives::Bytes;
+use alloy_primitives::{Address, Bytes, B256};
+use core::fmt;
+use std::sync::Arc;
+
+/// Identifies the execution a state root is being asked for.
+///
+/// A build is identified by its *contents*, not by its height: two builds for the same height
+/// can be in flight at once (`BasicPayloadJob::resolve_kind` races a second build against an
+/// unfinished one), so a resolver keyed on the block number alone can answer with the root of
+/// the other build.
+///
+/// Transactions are identified by `(signer, nonce)` rather than by hash, because that is what an
+/// executor can reconstruct: an `Evm` is handed a `TxEnv`, which carries the signer and the nonce
+/// but not the hash of the envelope they came from. The pair is no weaker as an identity — a
+/// block cannot contain two transactions with the same signer and nonce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadStateRootRequest<'a> {
+    /// Hash of the block being built on.
+    pub parent_hash: B256,
+    /// Number of the block being built.
+    pub number: u64,
+    /// `(signer, nonce)` of each transaction that was executed, in block order.
+    pub transactions: &'a [(Address, u64)],
+}
+
+/// Supplies the state root of a block whose root is a product of execution.
+///
+/// Returning `None` leaves the root to the usual computation, so a resolver that does not
+/// recognise a request is never a failure.
+pub type PayloadStateRootResolver =
+    Arc<dyn for<'a> Fn(&PayloadStateRootRequest<'a>) -> Option<B256> + Send + Sync>;
 
 /// Settings for the Ethereum builder.
-#[derive(PartialEq, Eq, Clone, Debug)]
+#[derive(Clone)]
 pub struct EthereumBuilderConfig {
     /// Desired gas limit.
     pub desired_gas_limit: u64,
@@ -18,6 +48,41 @@ pub struct EthereumBuilderConfig {
     pub extra_data: Bytes,
     /// Whether payload builds should skip state-root computation.
     pub skip_state_root: bool,
+    /// Supplies the state root once execution has ended, for chains whose root is a product of
+    /// execution rather than a walk of the account trie.
+    ///
+    /// Consulted after post-execution changes, so a root that only exists then — one computed by
+    /// the executor's own store, say — can still reach the built header. `None` keeps the stock
+    /// behaviour.
+    pub state_root_resolver: Option<PayloadStateRootResolver>,
+}
+
+// Hand-written: a resolver is a function, which has no equality and no useful `Debug`. Two
+// configs are equal when their settings are, and the resolver's presence is reported rather
+// than its contents.
+impl PartialEq for EthereumBuilderConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.desired_gas_limit == other.desired_gas_limit
+            && self.await_payload_on_missing == other.await_payload_on_missing
+            && self.max_blobs_per_block == other.max_blobs_per_block
+            && self.extra_data == other.extra_data
+            && self.skip_state_root == other.skip_state_root
+    }
+}
+
+impl Eq for EthereumBuilderConfig {}
+
+impl fmt::Debug for EthereumBuilderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EthereumBuilderConfig")
+            .field("desired_gas_limit", &self.desired_gas_limit)
+            .field("await_payload_on_missing", &self.await_payload_on_missing)
+            .field("max_blobs_per_block", &self.max_blobs_per_block)
+            .field("extra_data", &self.extra_data)
+            .field("skip_state_root", &self.skip_state_root)
+            .field("has_state_root_resolver", &self.state_root_resolver.is_some())
+            .finish()
+    }
 }
 
 impl Default for EthereumBuilderConfig {
@@ -35,7 +100,14 @@ impl EthereumBuilderConfig {
             max_blobs_per_block: None,
             extra_data: Bytes::new(),
             skip_state_root: false,
+            state_root_resolver: None,
         }
+    }
+
+    /// Supply the state root from execution rather than computing it.
+    pub fn with_state_root_resolver(mut self, resolver: PayloadStateRootResolver) -> Self {
+        self.state_root_resolver = Some(resolver);
+        self
     }
 
     /// Set desired gas limit.

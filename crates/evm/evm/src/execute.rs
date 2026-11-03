@@ -377,7 +377,41 @@ pub trait BlockBuilder {
         self,
         state_provider: impl StateProvider,
         state_root_precomputed: Option<(B256, TrieUpdates)>,
-    ) -> Result<BlockBuilderOutcome<Self::Primitives>, BlockExecutionError>;
+    ) -> Result<BlockBuilderOutcome<Self::Primitives>, BlockExecutionError>
+    where
+        Self: Sized,
+    {
+        self.finish_with(state_provider, |_| Ok(state_root_precomputed))
+    }
+
+    /// Completes the block building process, resolving the state root *after* execution has
+    /// ended.
+    ///
+    /// [`finish`](Self::finish) takes the root as a value, so it has to be known before this
+    /// call. That is fine for a root computed alongside execution — a sparse-trie pipeline
+    /// streaming updates has it ready — but not for one that only exists once execution is
+    /// over, which includes post-execution changes: withdrawal balance increments and the
+    /// EIP-7685 system calls both land inside this method, after the last transaction.
+    ///
+    /// `state_root` is therefore invoked once, after [`BlockExecutor::finish`] and
+    /// [`Evm::finish`] have run, and is handed the block's executed transactions so it can
+    /// identify *which* execution it is answering for. Two builds for the same height can be
+    /// in flight at once — see `BasicPayloadJob::resolve_kind`, which races a second build
+    /// against an unfinished one — so an implementation that keys off anything less specific
+    /// than the block's contents can answer with the wrong root.
+    ///
+    /// Returning `None` computes the root internally, exactly as `finish(.., None)` does.
+    ///
+    /// [`Evm::finish`]: crate::Evm::finish
+    fn finish_with<R>(
+        self,
+        state_provider: impl StateProvider,
+        state_root: R,
+    ) -> Result<BlockBuilderOutcome<Self::Primitives>, BlockExecutionError>
+    where
+        R: FnOnce(
+            &[Recovered<TxTy<Self::Primitives>>],
+        ) -> Result<Option<(B256, TrieUpdates)>, BlockExecutionError>;
 
     /// Provides mutable access to the inner [`BlockExecutor`].
     fn executor_mut(&mut self) -> &mut Self::Executor;
@@ -500,13 +534,22 @@ where
         }
     }
 
-    fn finish(
+    fn finish_with<R>(
         self,
         state: impl StateProvider,
-        state_root_precomputed: Option<(B256, TrieUpdates)>,
-    ) -> Result<BlockBuilderOutcome<N>, BlockExecutionError> {
+        state_root: R,
+    ) -> Result<BlockBuilderOutcome<N>, BlockExecutionError>
+    where
+        R: FnOnce(
+            &[Recovered<TxTy<N>>],
+        ) -> Result<Option<(B256, TrieUpdates)>, BlockExecutionError>,
+    {
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
+
+        // Execution is over — post-execution changes included — so a root that is a product of
+        // execution exists now and not before. `self.transactions` names which execution it was.
+        let state_root_precomputed = state_root(&self.transactions)?;
 
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);

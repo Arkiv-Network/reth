@@ -11,12 +11,13 @@ use crate::{
 };
 use alloy_consensus::BlockHeader;
 use futures::{stream::FusedStream, stream_select, FutureExt, StreamExt};
+use reth_chain_state::CanonicalStateProvider;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_db::{database_metrics::DatabaseMetrics, Database};
 use reth_engine_tree::{
     chain::{ChainEvent, FromOrchestrator},
     engine::{EngineApiKind, EngineApiRequest, EngineRequestHandler},
-    launch::EngineOrchestratorBuilder,
+    launch::{EngineOrchestratorBuilder, EnginePersistence},
     tree::TreeConfig,
 };
 use reth_engine_util::EngineMessageStreamExt;
@@ -24,7 +25,8 @@ use reth_exex::ExExManagerHandle;
 use reth_network::{types::BlockRangeUpdate, NetworkSyncUpdater, SyncState};
 use reth_network_api::BlockDownloaderProvider;
 use reth_node_api::{
-    BuiltPayload, ConsensusEngineHandle, FullNodeTypes, NodeTypes, NodeTypesWithDBAdapter,
+    BuiltPayload, ConsensusEngineHandle, FullNodeTypes, NodePrimitives, NodeTypes,
+    NodeTypesWithDBAdapter,
 };
 use reth_node_core::{
     args::PruneConfigKind,
@@ -34,8 +36,9 @@ use reth_node_core::{
 };
 use reth_node_events::node;
 use reth_provider::{
-    providers::{BlockchainProvider, NodeTypesForProvider},
-    BlockNumReader, StorageSettingsCache,
+    providers::{BlockchainProvider, NodeTypesForProvider, ProviderNodeTypes},
+    BlockNumReader, BlockReader, CanonChainTracker, DatabaseProviderFactory, ProviderFactory,
+    StateReader, StorageSettingsCache,
 };
 use reth_storage_overlay::OverlayManager;
 use reth_tasks::TaskExecutor;
@@ -45,15 +48,67 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+/// Builds the provider the engine runs on.
+///
+/// The launcher cannot just *accept* a provider: one needs a [`ProviderFactory`], which
+/// needs an open database, which needs the datadir only the launcher has. So the launcher
+/// constructs it, and this says what to construct. `Self::Provider` must be the same type
+/// as `T::Provider` for the node types being launched.
+pub trait EngineProviderBuilder<N: ProviderNodeTypes>: Send {
+    /// The provider this builds.
+    type Provider;
+
+    /// Construct the provider. Called once, during launch.
+    fn build_provider(self, factory: ProviderFactory<N>) -> eyre::Result<Self::Provider>;
+
+    /// A persistence service for the engine to use instead of reth's own.
+    ///
+    /// `None`, the default, spawns the built-in service over the provider
+    /// factory, which writes blocks into reth's database.
+    ///
+    /// A provider whose chain lives elsewhere returns its own handle here and
+    /// takes on what the built-in service owns: durability, pruning and crash
+    /// recovery. That is what keeps a single record of the chain -- with both
+    /// services running, every block is written to two stores, which can then
+    /// disagree after a crash.
+    ///
+    /// Called once, before [`build_provider`](Self::build_provider), so the
+    /// service is running before the engine can send it anything.
+    fn engine_persistence(
+        &self,
+    ) -> Option<reth_engine_tree::persistence::PersistenceHandle<N::Primitives>> {
+        None
+    }
+}
+
+/// The default [`EngineProviderBuilder`]: reth's own [`BlockchainProvider`].
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct BlockchainProviderBuilder;
+
+impl<N: ProviderNodeTypes> EngineProviderBuilder<N> for BlockchainProviderBuilder {
+    type Provider = BlockchainProvider<N>;
+
+    fn build_provider(self, factory: ProviderFactory<N>) -> eyre::Result<Self::Provider> {
+        Ok(BlockchainProvider::new(factory)?)
+    }
+}
+
 /// The engine node launcher.
+///
+/// `PB` selects the provider the engine runs on; swap it with
+/// [`with_provider_builder`](Self::with_provider_builder).
 #[derive(Debug)]
-pub struct EngineNodeLauncher {
+pub struct EngineNodeLauncher<PB = BlockchainProviderBuilder> {
     /// The task executor for the node.
     pub ctx: LaunchContext,
 
     /// Temporary configuration for engine tree.
     /// After engine is stabilized, this should be configured through node builder.
     pub engine_tree_config: TreeConfig,
+
+    /// Builds the provider the engine runs on.
+    pub provider_builder: PB,
 }
 
 impl EngineNodeLauncher {
@@ -63,7 +118,27 @@ impl EngineNodeLauncher {
         data_dir: ChainPath<DataDirPath>,
         engine_tree_config: TreeConfig,
     ) -> Self {
-        Self { ctx: LaunchContext::new(task_executor, data_dir), engine_tree_config }
+        Self {
+            ctx: LaunchContext::new(task_executor, data_dir),
+            engine_tree_config,
+            provider_builder: BlockchainProviderBuilder,
+        }
+    }
+}
+
+impl<PB> EngineNodeLauncher<PB> {
+    /// Run the engine on a provider of your own instead of [`BlockchainProvider`].
+    ///
+    /// Pair with `NodeBuilder::with_types_and_provider`, which sets `T::Provider`.
+    pub fn with_provider_builder<NewPB>(
+        self,
+        provider_builder: NewPB,
+    ) -> EngineNodeLauncher<NewPB> {
+        EngineNodeLauncher {
+            ctx: self.ctx,
+            engine_tree_config: self.engine_tree_config,
+            provider_builder,
+        }
     }
 
     async fn launch_node<N, DB, T, CB, AO>(
@@ -73,16 +148,26 @@ impl EngineNodeLauncher {
     where
         N: Node<RethFullAdapter<DB, N>> + NodeTypesForProvider,
         DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
-        T: FullNodeTypes<
-            Types = N,
-            Provider = BlockchainProvider<NodeTypesWithDBAdapter<N, DB>>,
-            DB = DB,
+        // `FullProvider` already supplies these traits; what it does not do is pin their
+        // associated types to this node's primitives, which naming a concrete provider
+        // used to. Hence the equalities.
+        T: FullNodeTypes<Types = N, DB = DB>,
+        T::Provider: CanonicalStateProvider<Primitives = <N as NodeTypes>::Primitives>
+            + CanonChainTracker
+            + StateReader<Receipt = <<N as NodeTypes>::Primitives as NodePrimitives>::Receipt>,
+        <T::Provider as DatabaseProviderFactory>::Provider: BlockReader<
+            Block = <<N as NodeTypes>::Primitives as NodePrimitives>::Block,
+            Header = <<N as NodeTypes>::Primitives as NodePrimitives>::BlockHeader,
+        >,
+        PB: EngineProviderBuilder<
+            NodeTypesWithDBAdapter<N, DB>,
+            Provider = <T as FullNodeTypes>::Provider,
         >,
         CB: NodeComponentsBuilder<T>,
         AO: RethRpcAddOns<NodeAdapter<T, CB::Components>>
             + EngineValidatorAddOn<NodeAdapter<T, CB::Components>>,
     {
-        let Self { ctx, engine_tree_config } = self;
+        let Self { ctx, engine_tree_config, provider_builder } = self;
         let NodeBuilderWithComponents {
             adapter: NodeTypesAdapter { database },
             rocksdb_provider,
@@ -97,6 +182,9 @@ impl EngineNodeLauncher {
             ctx.task_executor.state_trie_overlay_worker_pool(),
         );
         let disabled_stages = N::disabled_stages();
+        // Before the builder is moved into the closure below, and before the
+        // engine exists to send anything: see `EngineProviderBuilder::engine_persistence`.
+        let persistence_override = provider_builder.engine_persistence();
 
         // setup the launch context
         let ctx = ctx
@@ -135,7 +223,7 @@ impl EngineNodeLauncher {
             // passing FullNodeTypes as type parameter here so that we can build
             // later the components.
             .with_blockchain_db::<T, _>(move |provider_factory| {
-                Ok(BlockchainProvider::new(provider_factory)?)
+                provider_builder.build_provider(provider_factory)
             })?
             .with_components(components_builder, on_component_initialized).await?;
 
@@ -252,9 +340,18 @@ impl EngineNodeLauncher {
             incoming_requests: Box::pin(consensus_engine_stream),
             pipeline,
             pipeline_task_spawner: ctx.task_executor().clone(),
-            provider: ctx.provider_factory().clone(),
+            // A node that keeps its chain outside reth's database supplies its
+            // own service here and owns durability for it; see
+            // `Node::engine_persistence`. Running both would write every block
+            // to two stores that can disagree after a crash.
+            persistence: match persistence_override {
+                Some(handle) => EnginePersistence::External(handle),
+                None => EnginePersistence::Default {
+                    provider: ctx.provider_factory().clone(),
+                    pruner,
+                },
+            },
             blockchain_db: ctx.blockchain_db().clone(),
-            pruner,
             payload_builder: ctx.components().payload_builder_handle().clone(),
             payload_validator: engine_validator,
             overlay_manager,
@@ -445,13 +542,24 @@ impl EngineNodeLauncher {
     }
 }
 
-impl<N, DB, T, CB, AO> LaunchNode<NodeBuilderWithComponents<T, CB, AO>> for EngineNodeLauncher
+// Generic over `PB`, matching `launch_node` above: without this, a launcher
+// built by `with_provider_builder` has no `LaunchNode` impl and cannot be
+// passed to `launch_with`, which makes the provider seam unreachable.
+impl<N, DB, T, CB, AO, PB> LaunchNode<NodeBuilderWithComponents<T, CB, AO>>
+    for EngineNodeLauncher<PB>
 where
-    T: FullNodeTypes<
-        Types = N,
-        DB = DB,
-        Provider = BlockchainProvider<NodeTypesWithDBAdapter<N, DB>>,
+    T: FullNodeTypes<Types = N, DB = DB>,
+    T::Provider: CanonicalStateProvider<Primitives = <N as NodeTypes>::Primitives>
+        + CanonChainTracker
+        + StateReader<Receipt = <<N as NodeTypes>::Primitives as NodePrimitives>::Receipt>,
+    <T::Provider as DatabaseProviderFactory>::Provider: BlockReader<
+        Block = <<N as NodeTypes>::Primitives as NodePrimitives>::Block,
+        Header = <<N as NodeTypes>::Primitives as NodePrimitives>::BlockHeader,
     >,
+    PB: EngineProviderBuilder<
+            NodeTypesWithDBAdapter<N, DB>,
+            Provider = <T as FullNodeTypes>::Provider,
+        > + 'static,
     N: Node<RethFullAdapter<DB, N>> + NodeTypesForProvider,
     DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
     CB: NodeComponentsBuilder<T> + 'static,

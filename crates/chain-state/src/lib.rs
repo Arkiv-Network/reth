@@ -14,6 +14,9 @@ pub use execution_stats::ExecutionTimingStats;
 mod in_memory;
 pub use in_memory::*;
 
+mod canonical_state_provider;
+pub use canonical_state_provider::CanonicalStateProvider;
+
 mod preserved_sparse_trie;
 pub use preserved_sparse_trie::*;
 

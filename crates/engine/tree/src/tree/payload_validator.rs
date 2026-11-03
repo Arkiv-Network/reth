@@ -680,7 +680,15 @@ where
         // The second parameter `instrument_state_provider` controls whether we should
         // instrument the state provider with metrics.
         let make_state_provider = |fill_on_miss: bool| -> ProviderResult<EvmStateProviderBox> {
-            let provider = state_provider_factory.database_provider_ro()?.into_evm_state_provider();
+            // The node's own state when it supplies it; see
+            // `OverlayStateProviderFactory::node_evm_state_provider`.
+            let provider: EvmStateProviderBox =
+                match state_provider_factory.node_evm_state_provider() {
+                    Some(provider) => provider?,
+                    None => Box::new(
+                        state_provider_factory.database_provider_ro()?.into_evm_state_provider(),
+                    ),
+                };
             let provider: EvmStateProviderBox =
                 if let Some((caches, cache_metrics)) = &execution_cache {
                     let fill_mode = if fill_on_miss {

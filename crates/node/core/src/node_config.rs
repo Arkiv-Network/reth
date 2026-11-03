@@ -21,7 +21,7 @@ use reth_network_p2p::headers::client::HeadersClient;
 use reth_primitives_traits::SealedHeader;
 use reth_stages_types::StageId;
 use reth_storage_api::{
-    BlockHashReader, DatabaseProviderFactory, HeaderProvider, StageCheckpointReader,
+    BlockHashReader, HeaderProvider, StageCheckpointReader,
     StorageSettings,
 };
 use reth_storage_errors::provider::ProviderResult;
@@ -418,17 +418,21 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         Ok(max_block)
     }
 
-    /// Fetches the head block from the database.
+    /// Fetches the head block the node should resume from.
     ///
-    /// If the database is empty, returns the genesis block.
-    pub fn lookup_head<Factory>(&self, factory: &Factory) -> ProviderResult<Head>
+    /// If nothing has been recorded yet, returns the genesis block.
+    ///
+    /// Takes the node's own provider rather than a database factory. For the
+    /// stock node the two answer identically, since the provider reads the same
+    /// database. A node whose chain lives somewhere else -- an external store
+    /// reached through its provider rather than through
+    /// `DatabaseProviderFactory` -- can then report a resume point that agrees
+    /// with where its data actually is, instead of resuming from a database it
+    /// does not write to.
+    pub fn lookup_head<Provider>(&self, provider: &Provider) -> ProviderResult<Head>
     where
-        Factory: DatabaseProviderFactory<
-            Provider: HeaderProvider + StageCheckpointReader + BlockHashReader,
-        >,
+        Provider: HeaderProvider + StageCheckpointReader + BlockHashReader,
     {
-        let provider = factory.database_provider_ro()?;
-
         let head = provider.get_stage_checkpoint(StageId::Finish)?.unwrap_or_default().block_number;
 
         let header = provider

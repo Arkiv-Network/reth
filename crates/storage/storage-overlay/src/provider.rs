@@ -1,4 +1,4 @@
-use crate::{database_state_frontiers, ExecutionOverlay, OverlayBuilder, StateTrieOverlay};
+use crate::{ExecutionOverlay, OverlayBuilder, OverlayManager, StateTrieOverlay};
 use alloy_primitives::{Address, BlockHash, BlockNumber, B256, U256};
 use metrics::{Counter, Histogram};
 use reth_db_api::{cursor::DbDupCursorRO, tables, transaction::DbTx, DatabaseError};
@@ -12,7 +12,8 @@ use reth_primitives_traits::{
 use reth_prune_types::PruneSegment;
 use reth_storage_api::{
     AccountReader, BlockHashReader, BlockNumReader, BytecodeReader, ChangeSetReader, DBProvider,
-    DatabaseProviderFactory, DatabaseProviderROFactory, DbTxProvider, HashedPostStateProvider,
+    DatabaseProviderFactory, DatabaseProviderROFactory, DbTxProvider, EvmStateProviderBox,
+    HashedPostStateProvider,
     HistoryInfo, HistoryReader, PruneCheckpointReader, StageCheckpointReader, StateProofProvider,
     StateProvider, StateRootProvider, StorageChangeSetReader, StorageRootProvider,
     StorageSettingsCache,
@@ -62,6 +63,21 @@ pub struct OverlayStateProviderFactory<F, N: NodePrimitives = EthPrimitives> {
 }
 
 impl<F, N: NodePrimitives> OverlayStateProviderFactory<F, N> {
+    /// The state EVM execution should read, when the node supplies its own.
+    ///
+    /// `None` means the caller should read the database, which is what every
+    /// stock node does. A node that keeps its committed chain outside reth's
+    /// database installs a source, because the database the caller would
+    /// otherwise read is one it never writes -- and an unwritten database
+    /// answers every account with the genesis allocation rather than an error.
+    ///
+    /// Returns an `Option` rather than falling back here so that this costs
+    /// the caller no trait bounds it did not already have.
+    pub fn node_evm_state_provider(&self) -> Option<ProviderResult<EvmStateProviderBox>> {
+        let source = self.overlay_builder.overlay_manager().evm_state()?;
+        Some(source(self.overlay_builder.parent_hash()))
+    }
+
     /// Create a new overlay state provider factory.
     pub fn new(factory: F, overlay_builder: OverlayBuilder<N>) -> Self {
         Self {
@@ -237,6 +253,14 @@ where
         &self.provider
     }
 
+    /// The manager whose frontier source decides what counts as durable.
+    fn overlay_manager_ref(&self) -> &OverlayManager<N> {
+        self.overlay_builder
+            .as_ref()
+            .expect("overlay builder must be initialized or lazily resolvable")
+            .overlay_manager()
+    }
+
     fn state_trie_overlay(&self, trie_changesets: bool) -> ProviderResult<&StateTrieOverlay>
     where
         Provider::Target: StageCheckpointReader
@@ -252,7 +276,7 @@ where
             return Ok(overlay)
         }
 
-        let (state_trie_tip_block, finish_tip_block) = database_state_frontiers(self.provider())?;
+        let (state_trie_tip_block, finish_tip_block) = self.overlay_manager_ref().state_frontiers(self.provider())?;
         let overlay = match self.state_trie_overlay_cache.entry((
             state_trie_tip_block.hash,
             finish_tip_block.hash,
@@ -338,7 +362,7 @@ where
             return Ok((&overlay.overlay, overlay.historical_fallback.as_ref()))
         }
 
-        let (state_trie_tip_block, finish_tip_block) = database_state_frontiers(self.provider())?;
+        let (state_trie_tip_block, finish_tip_block) = self.overlay_manager_ref().state_frontiers(self.provider())?;
         let (overlay, fallback_block_number) = self
             .overlay_builder
             .as_ref()
